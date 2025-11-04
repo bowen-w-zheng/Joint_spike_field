@@ -30,7 +30,7 @@ from src.utils_joint import Trace
 # ============================================================================
 
 @jax.jit
-def _sample_omega_pg_batch(key: jr.KeyArray, psi: jnp.ndarray, omega_floor: float) -> jnp.ndarray:
+def _sample_omega_pg_batch(key, psi: jnp.ndarray, omega_floor: float) -> jnp.ndarray:
     """Fast batch Polyagamma sampler - stays in JAX."""
     N = psi.shape[0]
     keys = jr.split(key, N)
@@ -73,7 +73,7 @@ def run_joint_inference_jax(
     delta_spk: float,
     window_sec: float,
     rng_pg: np.random.Generator = np.random.default_rng(0),
-    key_jax: Optional[jr.KeyArray] = None,
+    key_jax = None,
     offset_sec: float = 0.0,
 ):
     """

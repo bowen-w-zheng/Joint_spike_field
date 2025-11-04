@@ -8,7 +8,7 @@ from src.joint_inference_core import JointMoments
 from src.params import OUParams
 from src.priors import gamma_prior_simple
 from src.pg_utils import sample_polya_gamma
-from src.polyagamma_jax import sample_pg_batch  # JAX-based sampler
+from src.polyagamma_jax import create_pg_sampler  # JAX-based pre-compiled sampler
 from src.utils_joint import Trace
 
 @dataclass
@@ -73,8 +73,11 @@ def run_joint_inference(
     else:
         sigma_u = config.sigma_u
 
-    # Initialize a separate JAX key for PG sampling if using JAX sampler
+    # Initialize JAX sampler state if using JAX backend
     key_pg_jax = None
+    pg_sampler_compiled = None  # Pre-compiled JAX sampler (lazy initialization)
+    pg_sampler_batch_size = None  # Track batch size for recompilation detection
+
     if config.pg_jax:
         import jax
         with jax.default_device(jax.devices("cpu")[0]):
@@ -83,13 +86,23 @@ def run_joint_inference(
     # Wrapper function to switch between numpy and JAX Polyagamma samplers
     def sample_pg_wrapper(psi: np.ndarray) -> np.ndarray:
         """Sample from Polya-Gamma distribution using either numpy or JAX backend."""
-        nonlocal key_pg_jax
+        nonlocal key_pg_jax, pg_sampler_compiled, pg_sampler_batch_size
 
         if config.pg_jax:
-            # Use JAX-based sampler
+            # Use JAX-based sampler with lazy compilation
             key_pg_jax, subkey = jr.split(key_pg_jax)
-            psi_jax = jnp.asarray(psi)
-            samples = sample_pg_batch(subkey, psi_jax, h=1.0)
+            psi_jax = jnp.asarray(psi, dtype=jnp.float64)
+            batch_size = psi_jax.shape[0]
+
+            # Compile sampler on first use or if batch size changed
+            if pg_sampler_compiled is None or pg_sampler_batch_size != batch_size:
+                if pg_sampler_batch_size is not None:
+                    print(f"[PG-JAX] Recompiling sampler: batch size changed from {pg_sampler_batch_size} to {batch_size}")
+                pg_sampler_compiled = create_pg_sampler(h=1.0, batch_size=batch_size, method='saddle', warmup=True)
+                pg_sampler_batch_size = batch_size
+
+            # Use pre-compiled sampler
+            samples = pg_sampler_compiled(subkey, psi_jax)
             return np.asarray(samples)
         else:
             # Use original numpy-based sampler

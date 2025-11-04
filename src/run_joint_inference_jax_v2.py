@@ -165,14 +165,13 @@ def _warmup_loop_scan(
     a0_ard: float,
     b0_ard: float,
     n_iter: int,
-) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+) -> Tuple[Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray], Tuple[jnp.ndarray, jnp.ndarray]]:
     """
     Warmup phase using jax.lax.scan for speed.
 
     Returns:
-        beta_final: (S, P)
-        gamma_final: (S, R)
-        tau2_final: (S, 2*B)
+        final_carry: (beta_final, gamma_final, tau2_final)
+        history: (beta_history, gamma_history) with shapes (n_iter, S, P) and (n_iter, S, R)
     """
     S = beta_init.shape[0]
 
@@ -195,16 +194,17 @@ def _warmup_loop_scan(
             Prec_gamma_all, mu_gamma_all, omega_all, tau2_intercept, a0_ard, b0_ard
         )
 
-        return (beta_new, gamma_new, tau2_new), None
+        # Return new state AND save beta/gamma for trace
+        return (beta_new, gamma_new, tau2_new), (beta_new, gamma_new)
 
     # Generate keys for all iterations
     keys = jr.split(key, n_iter)
 
     # Run scan
     init_carry = (beta_init, gamma_init, tau2_init)
-    final_carry, _ = lax.scan(scan_fn, init_carry, keys)
+    final_carry, history = lax.scan(scan_fn, init_carry, keys)
 
-    return final_carry  # (beta, gamma, tau2)
+    return final_carry, history  # (beta, gamma, tau2), (beta_hist, gamma_hist)
 
 
 @partial(jax.jit, static_argnames=['n_iter'])
@@ -226,11 +226,15 @@ def _inner_loop_scan(
     a0_ard: float,
     b0_ard: float,
     n_iter: int,
-) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+) -> Tuple[Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray], Tuple[jnp.ndarray, jnp.ndarray]]:
     """
     Inner refresh loop using jax.lax.scan.
 
     Samples gamma from posterior, then does Gibbs update with tight lock.
+
+    Returns:
+        final_carry: (beta_final, gamma_final, tau2_final)
+        history: (beta_history, gamma_history) with shapes (n_iter, S, P) and (n_iter, S, R)
     """
     S = beta_init.shape[0]
     R = gamma_init.shape[1]
@@ -268,13 +272,14 @@ def _inner_loop_scan(
         # Freeze beta0
         beta_new = beta_new.at[:, 0].set(beta0_fixed)
 
-        return (beta_new, gamma_samp, tau2_new), None
+        # Return new state AND save beta/gamma for trace
+        return (beta_new, gamma_samp, tau2_new), (beta_new, gamma_samp)
 
     keys = jr.split(key, n_iter)
     init_carry = (beta_init, gamma_init, tau2_init)
-    final_carry, _ = lax.scan(scan_fn, init_carry, keys)
+    final_carry, history = lax.scan(scan_fn, init_carry, keys)
 
-    return final_carry
+    return final_carry, history
 
 
 # ============================================================================
@@ -398,7 +403,7 @@ def run_joint_inference_jax_v2(
     t0 = time.time()
 
     key_warmup, key_jax = jr.split(key_jax)
-    beta_jax, gamma_jax, tau2_lat_jax = _warmup_loop_scan(
+    (beta_jax, gamma_jax, tau2_lat_jax), (beta_history, gamma_history) = _warmup_loop_scan(
         key_warmup,
         beta_jax,
         gamma_jax,
@@ -426,18 +431,45 @@ def run_joint_inference_jax_v2(
     beta_np = np.array(beta_jax)
     gamma_np = np.array(gamma_jax)
     tau2_lat_np = np.array(tau2_lat_jax)
+    beta_hist_np = np.array(beta_history)  # (n_iter, S, P)
+    gamma_hist_np = np.array(gamma_history)  # (n_iter, S, R)
 
-    print("[JAX-V2] Computing gamma posteriors...")
+    print("[JAX-V2] Computing beta0_fixed and gamma posteriors...")
 
-    # Freeze β0 (simplified - just use final values)
-    beta0_fixed = beta_np[:, 0].copy()
+    # CRITICAL FIX: Freeze β0 per train using median from warmup history
+    # Use last beta0_window iterations (or all if less)
+    beta0_window = min(config.beta0_window, config.fixed_iter)
+    beta0_recent = beta_hist_np[-beta0_window:, :, 0]  # (window, S)
+    beta0_fixed = np.median(beta0_recent, axis=0)  # (S,)
+
+    print(f"[JAX-V2]   Using median of last {beta0_window} iterations for beta0_fixed")
     beta_np[:, 0] = beta0_fixed
     beta_jax = jnp.array(beta_np)
 
-    # Gamma posteriors (using final gamma values as estimate)
-    mu_g_post = gamma_np.copy()
-    Sig_g_post = np.array([Sig_g for _ in range(S)])  # Use prior as posterior for now
-    Sig_g_lock = np.array([np.diag(1e-6 * np.clip(np.diag(Sig_g), 1e-10, None)) for _ in range(S)])
+    # CRITICAL FIX: Compute gamma posteriors from warmup history (matching original)
+    mu_g_post = np.zeros((S, R), dtype=np.float64)
+    Sig_g_post = np.zeros((S, R, R), dtype=np.float64)
+    Sig_g_lock = np.zeros((S, R, R), dtype=np.float64)
+
+    for s in range(S):
+        # Get all gamma samples for this train
+        gh = gamma_hist_np[:, s, :]  # (n_iter, R)
+        mu_s = gh.mean(axis=0)  # (R,)
+        ctr = gh - mu_s[None, :]  # (n_iter, R)
+        Sg = (ctr.T @ ctr) / max(gh.shape[0] - 1, 1)  # (R, R)
+        Sg = Sg + 1e-6 * np.eye(R)
+
+        mu_g_post[s] = mu_s
+        Sig_g_post[s] = Sg
+        diag_scale = np.clip(np.diag(Sg), 1e-10, None)
+        Sig_g_lock[s] = np.diag(1e-6 * diag_scale)
+
+    print(f"[JAX-V2]   Computed gamma posteriors from {config.fixed_iter} warmup samples")
+
+    # Add to trace (for compatibility)
+    for i in range(config.fixed_iter):
+        trace.beta.append(beta_hist_np[i])
+        trace.gamma.append(gamma_hist_np[i])
 
     # Convert to JAX
     beta0_fixed_jax = jnp.array(beta0_fixed)
@@ -464,7 +496,7 @@ def run_joint_inference_jax_v2(
         t_inner = jax.random.PRNGKey(r + 1000)  # Deterministic key per refresh
 
         key_inner, key_jax = jr.split(key_jax)
-        beta_jax, gamma_jax, tau2_lat_jax = _inner_loop_scan(
+        (beta_jax, gamma_jax, tau2_lat_jax), (beta_history, gamma_history) = _inner_loop_scan(
             key_inner,
             beta_jax,
             gamma_jax,
@@ -488,7 +520,15 @@ def run_joint_inference_jax_v2(
         # Convert for refresh step
         beta_np = np.array(beta_jax)
         gamma_np = np.array(gamma_jax)
-        beta_median = beta_np.copy()  # Use final values as "median"
+
+        # CRITICAL FIX: Compute median across inner iterations (matching original)
+        print(f"[JAX-V2]   Computing beta median across {config.inner_steps_per_refresh} iterations...")
+        beta_median = np.median(np.array(beta_history), axis=0)  # (S, 1+2J)
+
+        # Add to trace (for compatibility with original)
+        for i in range(config.inner_steps_per_refresh):
+            trace.beta.append(np.array(beta_history[i]))
+            trace.gamma.append(np.array(gamma_history[i]))
 
         # Build omega for refresh (vectorized in JAX)
         print(f"[JAX-V2]   Building omega for refresh...")

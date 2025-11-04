@@ -135,8 +135,8 @@ def run_joint_inference_jax(
 
     # ===== CONVERT TO JAX ONCE - these stay in JAX during hot loops =====
     print(f"[JAX-OPT] Converting data to JAX (happens ONCE)...")
-    X_jax = jnp.ascontiguousarray(design_np[:T_design], dtype=jnp.float64)
-    V_jax = jnp.ascontiguousarray(var_reim_np[:T_design], dtype=jnp.float64)
+    X_jax = jnp.array(np.ascontiguousarray(design_np[:T_design], dtype=np.float64))
+    V_jax = jnp.array(np.ascontiguousarray(var_reim_np[:T_design], dtype=np.float64))
     lat_slice = lat_reim_jax[:T_design]
 
     # Per-train data in JAX
@@ -315,8 +315,8 @@ def run_joint_inference_jax(
         # Update JAX arrays
         lat_reim_jax = jnp.asarray(lat_reim_np)
         design_np = np.asarray(build_design(lat_reim_jax))
-        X_jax = jnp.ascontiguousarray(design_np[:T_design], dtype=jnp.float64)
-        V_jax = jnp.ascontiguousarray(var_reim_np[:T_design], dtype=jnp.float64)
+        X_jax = jnp.array(np.ascontiguousarray(design_np[:T_design], dtype=np.float64))
+        V_jax = jnp.array(np.ascontiguousarray(var_reim_np[:T_design], dtype=np.float64))
         lat_slice = lat_reim_jax[:T_design]
 
         beta_jax = jnp.array(beta_np)
@@ -336,6 +336,10 @@ def run_joint_inference_jax(
         return beta_final[0], gamma_final[0], theta, trace
     else:
         return beta_final, gamma_final, theta, trace
+
+
+# Alias for drop-in replacement
+run_joint_inference = run_joint_inference_jax
 
 
 if __name__ == "__main__":

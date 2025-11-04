@@ -23,6 +23,7 @@ def _sample_pg_jax_batch(key: "jr.KeyArray", psi_flat: "jnp.ndarray") -> "jnp.nd
     n = psi_flat.shape[0]
     keys = jr.split(key, n)
     # vmap over all samples in parallel
+    print("Using JAX sampler, compiled")
     samples = jax.vmap(lambda k, z: sample_pg_saddle_single(k, 1.0, z))(keys, psi_flat)
     return samples
 

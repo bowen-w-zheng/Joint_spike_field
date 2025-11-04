@@ -7,8 +7,9 @@ from tqdm.auto import tqdm
 from src.joint_inference_core import JointMoments
 from src.params import OUParams
 from src.priors import gamma_prior_simple
-from src.pg_utils import sample_polya_gamma  # ← ADD THIS
-from src.utils_joint import Trace            # ← ADD THIS
+from src.pg_utils import sample_polya_gamma
+from src.polyagamma_jax import sample_pg_batch  # JAX-based sampler
+from src.utils_joint import Trace
 
 @dataclass
 class InferenceConfig:
@@ -20,6 +21,7 @@ class InferenceConfig:
     inner_steps_per_refresh: int = 100 # β/γ/ω updates between refreshes
     omega_floor: float = 1e-3          # keep PG rows well-behaved
     sigma_u: float = 0.05              # sigma_u for the OU process
+    pg_jax: bool = False               # if True, use JAX-based Polyagamma sampler (faster, GPU-capable)
 
 def run_joint_inference(
     Y_cube_block: np.ndarray,            # (J, M, K) complex TFR (derotated+scaled)
@@ -70,6 +72,28 @@ def run_joint_inference(
         config.sigma_u = 0.05
     else:
         sigma_u = config.sigma_u
+
+    # Initialize a separate JAX key for PG sampling if using JAX sampler
+    key_pg_jax = None
+    if config.pg_jax:
+        import jax
+        with jax.default_device(jax.devices("cpu")[0]):
+            key_pg_jax = jr.PRNGKey(42)  # separate seed for PG sampling
+
+    # Wrapper function to switch between numpy and JAX Polyagamma samplers
+    def sample_pg_wrapper(psi: np.ndarray) -> np.ndarray:
+        """Sample from Polya-Gamma distribution using either numpy or JAX backend."""
+        nonlocal key_pg_jax
+
+        if config.pg_jax:
+            # Use JAX-based sampler
+            key_pg_jax, subkey = jr.split(key_pg_jax)
+            psi_jax = jnp.asarray(psi)
+            samples = sample_pg_batch(subkey, psi_jax, h=1.0)
+            return np.asarray(samples)
+        else:
+            # Use original numpy-based sampler
+            return sample_polya_gamma(np.asarray(psi), rng_pg)
     # ── Shapes & normalization to multi-spike ──────────────────────────────
     J, M, K = Y_cube_block.shape
     single_spike_mode = (spikes.ndim == 1)
@@ -128,7 +152,7 @@ def run_joint_inference(
     omega_S = np.empty((S, T_design), dtype=np.float64)
     for s in range(S):
         psi0 = X_slice @ beta[s] + H_slice[s] @ gamma[s]
-        omega_S[s] = np.maximum(sample_polya_gamma(np.asarray(psi0), rng_pg), config.omega_floor)
+        omega_S[s] = np.maximum(sample_pg_wrapper(np.asarray(psi0)), config.omega_floor)
 
     # ── Trace bookkeeping (store arrays per iteration) ──────────────────────
     trace = Trace()
@@ -144,7 +168,7 @@ def run_joint_inference(
     for _ in pbar_warm:
         for s in range(S):
             psi   = X_slice @ beta[s] + H_slice[s] @ gamma[s]
-            omega = np.maximum(sample_polya_gamma(np.asarray(psi), rng_pg), config.omega_floor)
+            omega = np.maximum(sample_pg_wrapper(np.asarray(psi)), config.omega_floor)
             key_jax, b_new, g_new, t2_new = gibbs_update_beta_robust(
                 key_jax,
                 lat_slice,
@@ -199,7 +223,7 @@ def run_joint_inference(
             for s in range(S):
                 gamma_samp = rng_pg.multivariate_normal(mean=mu_g_post[s], cov=Sig_g_post[s])
                 psi   = X_slice @ beta[s] + H_slice[s] @ gamma_samp
-                omega = np.maximum(sample_polya_gamma(np.asarray(psi), rng_pg), config.omega_floor)
+                omega = np.maximum(sample_pg_wrapper(np.asarray(psi)), config.omega_floor)
 
                 key_jax, b_new, g_new, t2_new = gibbs_update_beta_robust(
                     key_jax,
@@ -230,7 +254,7 @@ def run_joint_inference(
         for s in range(S):
             gamma_samp = rng_pg.multivariate_normal(mean=mu_g_post[s], cov=Sig_g_post[s])
             psi_refresh = X_slice @ beta_median[s] + H_slice[s] @ gamma_samp
-            omega_refresh[s] = np.maximum(sample_polya_gamma(np.asarray(psi_refresh), rng_pg), config.omega_floor)
+            omega_refresh[s] = np.maximum(sample_pg_wrapper(np.asarray(psi_refresh)), config.omega_floor)
             gamma[s] = gamma_samp   # keep the draw used at refresh
 
         
@@ -269,7 +293,7 @@ def run_joint_inference(
         # prep ω for next block (per train)
         for s in range(S):
             psi = X_slice @ beta[s] + H_slice[s] @ gamma[s]
-            omega_S[s] = np.maximum(sample_polya_gamma(np.asarray(psi), rng_pg), config.omega_floor)
+            omega_S[s] = np.maximum(sample_pg_wrapper(np.asarray(psi)), config.omega_floor)
 
         # bookkeeping
         trace.theta.append(theta)

@@ -11,34 +11,9 @@ from src.priors import gamma_prior_simple
 from src.pg_utils import sample_polya_gamma
 from src.polyagamma_jax import sample_pg_saddle_single  # Direct JAX saddle point sampler
 from src.utils_joint import Trace
-<<<<<<< HEAD
 print("jax version:", jax.__version__)
 # Enable 64-bit precision
 jax.config.update("jax_enable_x64", True)
-=======
-
-# Pre-compiled JAX Polyagamma batch sampler (matches fast reference implementation)
-# Defined at module level for proper JIT compilation
-@jax.jit
-def _sample_omega_pg_batch(key: "jr.KeyArray", psi: "jnp.ndarray", omega_floor: float) -> "jnp.ndarray":
-    """
-    Fast batch Polyagamma sampler using saddle point method.
-    Matches the pattern from the fast reference implementation.
-
-    Args:
-        key: JAX random key
-        psi: (N,) array of log-odds parameters
-        omega_floor: minimum omega value
-
-    Returns:
-        (N,) array of PG(1, psi) samples
-    """
-    N = psi.shape[0]
-    keys = jr.split(key, N)
-    omega = jax.vmap(lambda k, z: sample_pg_saddle_single(k, 1.0, z))(keys, psi)
-    return jnp.maximum(omega, omega_floor)
-
->>>>>>> 70d479645613a9c3c63e396e727f0bab64a689d6
 @dataclass
 class InferenceConfig:
     # NEW: do a warm-up before any latent refresh; freeze β0 after warm-up

@@ -11,7 +11,9 @@ from src.priors import gamma_prior_simple
 from src.pg_utils import sample_polya_gamma
 from src.polyagamma_jax import create_pg_sampler  # JAX pre-compiled sampler factory
 from src.utils_joint import Trace
-
+print("jax version:", jax.__version__)
+# Enable 64-bit precision
+jax.config.update("jax_enable_x64", True)
 @dataclass
 class InferenceConfig:
     # NEW: do a warm-up before any latent refresh; freeze β0 after warm-up

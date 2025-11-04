@@ -397,6 +397,12 @@ def run_joint_inference_jax_v2(
 
     print(f"[JAX-V2] Data: S={S}, T={T_design}, B={B}, R={R}, P={P}")
 
+    # ===== Initialize trace =====
+    trace = Trace()
+    trace.theta.append(theta)
+    trace.latent.append(lat_reim_jax)
+    trace.fine_latent.append(np.asarray(fine0.mu))
+
     # ===== WARMUP with jax.lax.scan =====
     print(f"[JAX-V2] Running warmup with jax.lax.scan (JIT-compiled)...")
     import time
@@ -480,11 +486,6 @@ def run_joint_inference_jax_v2(
     # ===== REFRESH PASSES =====
     from src.state_index import StateIndex
     sidx = StateIndex(J, M)
-
-    trace = Trace()
-    trace.theta.append(theta)
-    trace.latent.append(lat_reim_jax)
-    trace.fine_latent.append(np.asarray(fine0.mu))
 
     print(f"[JAX-V2] Starting {config.n_refreshes} refresh passes...")
 

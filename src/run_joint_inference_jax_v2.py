@@ -207,6 +207,76 @@ def _warmup_loop_scan(
     return final_carry  # (beta, gamma, tau2)
 
 
+@partial(jax.jit, static_argnames=['n_iter'])
+def _inner_loop_scan(
+    key,
+    beta_init: jnp.ndarray,     # (S, P)
+    gamma_init: jnp.ndarray,    # (S, R)
+    tau2_init: jnp.ndarray,     # (S, 2*B)
+    beta0_fixed: jnp.ndarray,   # (S,) frozen intercepts
+    X: jnp.ndarray,             # (T, P) shared design
+    H_all: jnp.ndarray,         # (S, T, R) per-train history
+    spikes_all: jnp.ndarray,    # (S, T) binary
+    V: jnp.ndarray,             # (T, 2*B) shared latent variances
+    Prec_gamma_lock: jnp.ndarray,  # (S, R, R) tight lock
+    mu_gamma_post: jnp.ndarray,    # (S, R) posterior mean
+    Sigma_gamma_post: jnp.ndarray, # (S, R, R) posterior cov
+    omega_floor: float,
+    tau2_intercept: float,
+    a0_ard: float,
+    b0_ard: float,
+    n_iter: int,
+) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """
+    Inner refresh loop using jax.lax.scan.
+
+    Samples gamma from posterior, then does Gibbs update with tight lock.
+    """
+    S = beta_init.shape[0]
+    R = gamma_init.shape[1]
+
+    def scan_fn(carry, key_iter):
+        beta, gamma, tau2 = carry
+
+        # Sample gamma from posterior for all trains
+        keys_gamma = jr.split(key_iter, S)
+
+        def sample_mvn(key, mu, Sigma):
+            """Sample from multivariate normal"""
+            L = jnp.linalg.cholesky(Sigma + 1e-6 * jnp.eye(R))
+            z = jr.normal(key, shape=(R,))
+            return mu + L @ z
+
+        gamma_samp = vmap(sample_mvn)(keys_gamma, mu_gamma_post, Sigma_gamma_post)  # (S, R)
+
+        # Compute psi with sampled gamma
+        psi_all = vmap(lambda b, g, h: X @ b + h @ g)(beta, gamma_samp, H_all)  # (S, T)
+
+        # Sample omega
+        keys_omega = jr.split(jr.fold_in(key_iter, 1), S)
+        omega_all = vmap(lambda k, psi: _sample_omega_pg_batch(k, psi, omega_floor))(
+            keys_omega, psi_all
+        )
+
+        # Gibbs update with tight lock on gamma
+        keys_gibbs = jr.split(jr.fold_in(key_iter, 2), S)
+        beta_new, _, tau2_new = _gibbs_update_vectorized(
+            keys_gibbs, beta, gamma_samp, tau2, X, H_all, spikes_all, V,
+            Prec_gamma_lock, gamma_samp, omega_all, tau2_intercept, a0_ard, b0_ard
+        )
+
+        # Freeze beta0
+        beta_new = beta_new.at[:, 0].set(beta0_fixed)
+
+        return (beta_new, gamma_samp, tau2_new), None
+
+    keys = jr.split(key, n_iter)
+    init_carry = (beta_init, gamma_init, tau2_init)
+    final_carry, _ = lax.scan(scan_fn, init_carry, keys)
+
+    return final_carry
+
+
 # ============================================================================
 # Configuration
 # ============================================================================
@@ -352,26 +422,151 @@ def run_joint_inference_jax_v2(
     print(f"[JAX-V2] Warmup completed in {time.time()-t0:.2f}s")
     print(f"[JAX-V2] That's {(time.time()-t0)/config.fixed_iter*1000:.1f}ms per iteration")
 
-    # Convert back for rest of algorithm
+    # Convert back to compute posteriors
     beta_np = np.array(beta_jax)
     gamma_np = np.array(gamma_jax)
     tau2_lat_np = np.array(tau2_lat_jax)
 
-    # ===== REST: Keep original logic for now =====
-    print("[JAX-V2] Continuing with refresh passes (TODO: also optimize with scan)...")
+    print("[JAX-V2] Computing gamma posteriors...")
 
-    # For now, just return the warmup results
-    # TODO: Also optimize refresh passes with scan
+    # Freeze β0 (simplified - just use final values)
+    beta0_fixed = beta_np[:, 0].copy()
+    beta_np[:, 0] = beta0_fixed
+    beta_jax = jnp.array(beta_np)
+
+    # Gamma posteriors (using final gamma values as estimate)
+    mu_g_post = gamma_np.copy()
+    Sig_g_post = np.array([Sig_g for _ in range(S)])  # Use prior as posterior for now
+    Sig_g_lock = np.array([np.diag(1e-6 * np.clip(np.diag(Sig_g), 1e-10, None)) for _ in range(S)])
+
+    # Convert to JAX
+    beta0_fixed_jax = jnp.array(beta0_fixed)
+    mu_gamma_post_jax = jnp.array(mu_g_post)
+    Sigma_gamma_post_jax = jnp.array(Sig_g_post)
+    Prec_gamma_lock_jax = jnp.array([np.linalg.pinv(Sig_g_lock[s]) for s in range(S)])
+
+    # ===== REFRESH PASSES =====
+    from src.state_index import StateIndex
+    sidx = StateIndex(J, M)
 
     trace = Trace()
     trace.theta.append(theta)
     trace.latent.append(lat_reim_jax)
     trace.fine_latent.append(np.asarray(fine0.mu))
 
+    print(f"[JAX-V2] Starting {config.n_refreshes} refresh passes...")
+
+    for r in range(config.n_refreshes):
+        print(f"[JAX-V2] Refresh {r+1}/{config.n_refreshes}...")
+
+        # ===== Inner loop with jax.lax.scan =====
+        print(f"[JAX-V2]   Running {config.inner_steps_per_refresh} inner steps with scan...")
+        t_inner = jax.random.PRNGKey(r + 1000)  # Deterministic key per refresh
+
+        key_inner, key_jax = jr.split(key_jax)
+        beta_jax, gamma_jax, tau2_lat_jax = _inner_loop_scan(
+            key_inner,
+            beta_jax,
+            gamma_jax,
+            tau2_lat_jax,
+            beta0_fixed_jax,
+            X_jax,
+            H_jax,
+            spikes_jax,
+            V_jax,
+            Prec_gamma_lock_jax,
+            mu_gamma_post_jax,
+            Sigma_gamma_post_jax,
+            config.omega_floor,
+            100.0**2,
+            a0_ard,
+            b0_ard,
+            config.inner_steps_per_refresh,
+        )
+        beta_jax = beta_jax.block_until_ready()
+
+        # Convert for refresh step
+        beta_np = np.array(beta_jax)
+        gamma_np = np.array(gamma_jax)
+        beta_median = beta_np.copy()  # Use final values as "median"
+
+        # Build omega for refresh (vectorized in JAX)
+        print(f"[JAX-V2]   Building omega for refresh...")
+        key_omega_refresh, key_jax = jr.split(key_jax)
+
+        # Sample gamma for refresh
+        keys_gamma_refresh = jr.split(key_omega_refresh, S)
+        def sample_mvn(key, mu, Sigma):
+            L = jnp.linalg.cholesky(Sigma + 1e-6 * jnp.eye(R))
+            z = jr.normal(key, shape=(R,))
+            return mu + L @ z
+        gamma_refresh_jax = vmap(sample_mvn)(keys_gamma_refresh, mu_gamma_post_jax, Sigma_gamma_post_jax)
+
+        # Compute psi and sample omega
+        psi_refresh_all = vmap(lambda b, g, h: X_jax @ b + h @ g)(
+            jnp.array(beta_median), gamma_refresh_jax, H_jax
+        )
+        keys_omega_all = jr.split(jr.fold_in(key_omega_refresh, 1), S)
+        omega_refresh_jax = vmap(lambda k, psi: _sample_omega_pg_batch(k, psi, config.omega_floor))(
+            keys_omega_all, psi_refresh_all
+        )
+
+        omega_refresh = np.array(omega_refresh_jax)
+        gamma_np = np.array(gamma_refresh_jax)
+
+        # ===== Latent refresh (numpy-based, unavoidable) =====
+        print(f"[JAX-V2]   Running latent refresh (KF)...")
+        mom = joint_kf_rts_moments(
+            Y_cube=Y_cube_block, theta=theta,
+            delta_spk=delta_spk, win_sec=window_sec, offset_sec=offset_sec,
+            beta=beta_median,
+            gamma=gamma_np,
+            spikes=spikes_S,
+            omega=omega_refresh,
+            coupled_bands_idx=np.arange(J, dtype=np.int64),
+            freqs_for_phase=np.asarray(all_freqs, np.float64),
+            sidx=sidx, H_hist=H_hist_S,
+            sigma_u=sigma_u
+        )
+
+        # Rebuild regressors
+        lat_reim_np, var_reim_np = extract_band_reim_with_var(
+            mu_fine=mom.m_s, var_fine=mom.P_s,
+            coupled_bands=all_freqs, freqs_hz=all_freqs, delta_spk=delta_spk, J=J, M=M
+        )
+
+        # Update JAX arrays for next refresh
+        lat_reim_jax = jnp.asarray(lat_reim_np)
+        design_np = np.asarray(build_design(lat_reim_jax))
+        T_design_new = min(int(design_np.shape[0]), H_hist_S.shape[1], spikes_S.shape[1])
+
+        if T_design_new != T_design:
+            print(f"[JAX-V2]   Warning: T_design changed from {T_design} to {T_design_new}")
+            # Would need to recompile - skip for now
+            T_design_new = T_design
+
+        X_jax = jnp.array(np.ascontiguousarray(design_np[:T_design], dtype=np.float64))
+        V_jax = jnp.array(np.ascontiguousarray(var_reim_np[:T_design], dtype=np.float64))
+        lat_slice = lat_reim_jax[:T_design]
+
+        beta_jax = jnp.array(beta_np)
+        gamma_jax = jnp.array(gamma_np)
+
+        # Update trace
+        trace.theta.append(theta)
+        trace.latent.append(lat_reim_jax)
+        trace.fine_latent.append(mom.m_s)
+
+    # Final outputs
+    beta_final = np.array(beta_jax)
+    gamma_final = np.array(gamma_jax)
+
+    print("[JAX-V2] Inference complete!")
+
     if single_spike_mode:
-        return beta_np[0], gamma_np[0], theta, trace
+        return beta_final[0], gamma_final[0], theta, trace
     else:
-        return beta_np, gamma_np, theta, trace
+        return beta_final, gamma_final, theta, trace
 
 
 # Alias

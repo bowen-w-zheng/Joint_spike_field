@@ -1,6 +1,7 @@
 from dataclasses import dataclass, field
 from typing import Callable, Optional, Sequence, Tuple, List
 import numpy as np
+import jax
 import jax.numpy as jnp
 import jax.random as jr
 from tqdm.auto import tqdm
@@ -8,8 +9,22 @@ from src.joint_inference_core import JointMoments
 from src.params import OUParams
 from src.priors import gamma_prior_simple
 from src.pg_utils import sample_polya_gamma
-from src.polyagamma_jax import create_pg_sampler  # JAX-based pre-compiled sampler
+from src.polyagamma_jax import sample_pg_saddle_single  # JAX saddle point sampler
 from src.utils_joint import Trace
+
+# Pre-compiled JAX Polyagamma sampler (compiled once, reused for all calls)
+# This is defined at module level to ensure it's JIT-compiled only once
+@jax.jit
+def _sample_pg_jax_batch(key: "jr.KeyArray", psi_flat: "jnp.ndarray") -> "jnp.ndarray":
+    """
+    JIT-compiled batch Polyagamma sampler using saddle point method.
+    Compiles once on first call, then reuses compiled code for all subsequent calls.
+    """
+    n = psi_flat.shape[0]
+    keys = jr.split(key, n)
+    # vmap over all samples in parallel
+    samples = jax.vmap(lambda k, z: sample_pg_saddle_single(k, 1.0, z))(keys, psi_flat)
+    return samples
 
 @dataclass
 class InferenceConfig:
@@ -73,11 +88,8 @@ def run_joint_inference(
     else:
         sigma_u = config.sigma_u
 
-    # Initialize JAX sampler state if using JAX backend
+    # Initialize JAX RNG key if using JAX backend
     key_pg_jax = None
-    pg_sampler_compiled = None  # Pre-compiled JAX sampler (lazy initialization)
-    pg_sampler_batch_size = None  # Track batch size for recompilation detection
-
     if config.pg_jax:
         import jax
         with jax.default_device(jax.devices("cpu")[0]):
@@ -85,24 +97,19 @@ def run_joint_inference(
 
     # Wrapper function to switch between numpy and JAX Polyagamma samplers
     def sample_pg_wrapper(psi: np.ndarray) -> np.ndarray:
-        """Sample from Polya-Gamma distribution using either numpy or JAX backend."""
-        nonlocal key_pg_jax, pg_sampler_compiled, pg_sampler_batch_size
+        """
+        Sample from Polya-Gamma distribution using either numpy or JAX backend.
+
+        JAX version uses _sample_pg_jax_batch which is JIT-compiled once at module load.
+        No recompilation occurs - the compiled function is reused for all calls.
+        """
+        nonlocal key_pg_jax
 
         if config.pg_jax:
-            # Use JAX-based sampler with lazy compilation
+            # Use pre-compiled JAX sampler (saddle point method, vmapped)
             key_pg_jax, subkey = jr.split(key_pg_jax)
             psi_jax = jnp.asarray(psi, dtype=jnp.float64)
-            batch_size = psi_jax.shape[0]
-
-            # Compile sampler on first use or if batch size changed
-            if pg_sampler_compiled is None or pg_sampler_batch_size != batch_size:
-                if pg_sampler_batch_size is not None:
-                    print(f"[PG-JAX] Recompiling sampler: batch size changed from {pg_sampler_batch_size} to {batch_size}")
-                pg_sampler_compiled = create_pg_sampler(h=1.0, batch_size=batch_size, method='saddle', warmup=True)
-                pg_sampler_batch_size = batch_size
-
-            # Use pre-compiled sampler
-            samples = pg_sampler_compiled(subkey, psi_jax)
+            samples = _sample_pg_jax_batch(subkey, psi_jax)
             return np.asarray(samples)
         else:
             # Use original numpy-based sampler

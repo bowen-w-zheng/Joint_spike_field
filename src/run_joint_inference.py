@@ -9,8 +9,29 @@ from src.joint_inference_core import JointMoments
 from src.params import OUParams
 from src.priors import gamma_prior_simple
 from src.pg_utils import sample_polya_gamma
-from src.polyagamma_jax import create_pg_sampler  # JAX pre-compiled sampler factory
+from src.polyagamma_jax import sample_pg_saddle_single  # Direct JAX saddle point sampler
 from src.utils_joint import Trace
+
+# Pre-compiled JAX Polyagamma batch sampler (matches fast reference implementation)
+# Defined at module level for proper JIT compilation
+@jax.jit
+def _sample_omega_pg_batch(key: "jr.KeyArray", psi: "jnp.ndarray", omega_floor: float) -> "jnp.ndarray":
+    """
+    Fast batch Polyagamma sampler using saddle point method.
+    Matches the pattern from the fast reference implementation.
+
+    Args:
+        key: JAX random key
+        psi: (N,) array of log-odds parameters
+        omega_floor: minimum omega value
+
+    Returns:
+        (N,) array of PG(1, psi) samples
+    """
+    N = psi.shape[0]
+    keys = jr.split(key, N)
+    omega = jax.vmap(lambda k, z: sample_pg_saddle_single(k, 1.0, z))(keys, psi)
+    return jnp.maximum(omega, omega_floor)
 
 @dataclass
 class InferenceConfig:
@@ -74,11 +95,8 @@ def run_joint_inference(
     else:
         sigma_u = config.sigma_u
 
-    # Initialize JAX RNG key and sampler if using JAX backend
+    # Initialize JAX RNG key if using JAX backend
     key_pg_jax = None
-    pg_sampler_compiled = None  # Lazy-initialized pre-compiled sampler
-    pg_sampler_batch_size = None  # Track batch size for recompilation detection
-
     if config.pg_jax:
         import jax
         with jax.default_device(jax.devices("cpu")[0]):
@@ -89,40 +107,16 @@ def run_joint_inference(
         """
         Sample from Polya-Gamma distribution using either numpy or JAX backend.
 
-        JAX version uses create_pg_sampler() which is pre-compiled and warmed up
-        specifically for the batch size used in this inference run.
+        JAX version uses _sample_omega_pg_batch which is JIT-compiled at module level.
+        This matches the fast reference implementation pattern.
         """
-        nonlocal key_pg_jax, pg_sampler_compiled, pg_sampler_batch_size
+        nonlocal key_pg_jax
 
         if config.pg_jax:
-            # Use pre-compiled JAX sampler (saddle method, with warmup)
+            # Use JAX sampler (direct vmap of saddle point method)
             key_pg_jax, subkey = jr.split(key_pg_jax)
             psi_jax = jnp.asarray(psi, dtype=jnp.float64)
-            batch_size = psi_jax.shape[0]
-
-            # Create and warm up sampler on first call
-            if pg_sampler_compiled is None:
-                print(f"[PG-JAX] Creating and warming up sampler (batch_size={batch_size}, method='saddle')...")
-                import time
-                t0 = time.time()
-                pg_sampler_compiled = create_pg_sampler(
-                    h=1.0,
-                    batch_size=batch_size,
-                    method='saddle',  # Fastest for most cases
-                    warmup=True  # Do 3 warmup runs
-                )
-                pg_sampler_batch_size = batch_size
-                print(f"[PG-JAX] Sampler ready in {time.time()-t0:.3f}s. Subsequent calls will be fast.")
-            elif batch_size != pg_sampler_batch_size:
-                # Batch size changed - need to recompile (should be rare)
-                print(f"[PG-JAX] Batch size changed from {pg_sampler_batch_size} to {batch_size}, recompiling...")
-                import time
-                t0 = time.time()
-                pg_sampler_compiled = create_pg_sampler(h=1.0, batch_size=batch_size, method='saddle', warmup=True)
-                pg_sampler_batch_size = batch_size
-                print(f"[PG-JAX] Recompilation complete in {time.time()-t0:.3f}s")
-
-            samples = pg_sampler_compiled(subkey, psi_jax)
+            samples = _sample_omega_pg_batch(subkey, psi_jax, config.omega_floor)
             return np.asarray(samples)
         else:
             # Use original numpy-based sampler

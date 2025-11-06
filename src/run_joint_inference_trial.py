@@ -8,15 +8,19 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 import jax.random as jr
+import sys
+import os
+# Add parent directory to sys.path if running as script
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.params import OUParams
 from src.utils_joint import Trace
 from src.state_index import StateIndex
 
 # trial-aware core (pooling wrapper → calls your untouched core)
-from src.joint_inference_core_trial import joint_kf_rts_moments_trials
+from joint_inference_core_trial_fast import joint_kf_rts_moments_trials
 # trial-aware beta sampler
-from src.beta_sampler_trials import gibbs_update_beta_trials_shared, TrialBetaConfig
+from beta_sampler_trials_jax import gibbs_update_beta_trials_shared, TrialBetaConfig
 # fast JAX PG sampler
 from src.polyagamma_jax import sample_pg_saddle_single
 

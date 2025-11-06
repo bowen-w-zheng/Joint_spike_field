@@ -27,11 +27,7 @@ def _pool_spike_pg_exact(
     if (H_SRTL is not None) and (gamma_shared is not None):
         H = np.asarray(H_SRTL, float)                                    # (S,R,T,L)
         g = np.asarray(gamma_shared, float)                              # (S,L)
-        g = g[:, None, :]                                                # (S,1,L) -> broadcast to (S,R,L) in einsum
-        h_SRT = np.einsum('srtl,ssl->srt', H, np.broadcast_to(g,(S,S,g.shape[-1])))  # trick to broadcast g over R
-        # simpler & clearer:
-        # h_SRT = np.einsum('srtl,sl->srt', H, gamma_shared)
-        h_SRT = np.einsum('srtl,sl->srt', H, gamma_shared)
+        h_SRT = np.einsum('srtl,sl->srt', H, g)
         hbar_ST = (ω*h_SRT).sum(axis=1) / ωST                            # (S,T)
     else:
         hbar_ST = np.zeros_like(ωST)

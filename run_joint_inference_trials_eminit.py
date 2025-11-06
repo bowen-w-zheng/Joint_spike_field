@@ -18,23 +18,9 @@ from src.state_index import StateIndex
 from src.joint_inference_core_trial import joint_kf_rts_moments_trials
 # trial-aware beta sampler
 from src.beta_sampler_trials import gibbs_update_beta_trials_shared, TrialBetaConfig
-# fast JAX PG sampler
-from src.polyagamma_jax import sample_pg_saddle_single
-
-
-# ========================= JAX helpers =========================
-
-@jax.jit
-def _sample_omega_pg_batch(key, psi: jnp.ndarray, omega_floor: float) -> jnp.ndarray:
-    N = psi.shape[0]
-    keys = jr.split(key, N)
-    omega = jax.vmap(lambda k, z: sample_pg_saddle_single(k, 1.0, z))(keys, psi)
-    return jnp.maximum(omega, omega_floor)
-
-@jax.jit
-def _build_design_jax(latent_reim: jnp.ndarray) -> jnp.ndarray:
-    T = latent_reim.shape[0]
-    return jnp.concatenate([jnp.ones((T, 1)), latent_reim], axis=1)
+# PG samplers
+from src.pg_utils import sample_polya_gamma
+from src.polyagamma_jax import sample_pg_batch
 
 
 # ========================= Config =========================
@@ -58,6 +44,8 @@ class InferenceTrialsEMConfig:
     pool_spike_trials: bool = True
     # EM settings
     em_kwargs: Dict[str, Any] = None            # e.g. dict(max_iter=20000, tol=1e-3, sig_eps_init=5.0, log_every=1000)
+    # Sampler choice
+    pg_jax: bool = False                        # if True, use JAX-based PG sampler (faster)
     # RNG
     key_jax: Optional["jr.KeyArray"] = None
 
@@ -174,6 +162,7 @@ def run_joint_inference_trials(
     gamma_prior_mu: Optional[np.ndarray] = None,     # (Rlags,) or (S,Rlags) or (S,R,Rlags)
     gamma_prior_Sigma: Optional[np.ndarray] = None,  # (Rlags,Rlags) or (S,...) or (S,R,...)
     config: Optional[InferenceTrialsEMConfig] = None,
+    rng_pg: np.random.Generator = np.random.default_rng(0),
 ) -> Tuple[np.ndarray, np.ndarray, OUParams, Trace]:
     """
     EM-initialised trial-aware joint inference:
@@ -196,6 +185,26 @@ def run_joint_inference_trials(
     assert Rtr == R, "Y_trials and spikes must have the same trial count"
     Rlags = H_SRTL.shape[-1]
     P = 1 + 2 * J
+
+    # Initialize JAX PG sampler if requested
+    key_pg_jax = None
+    if config.pg_jax:
+        import jax
+        with jax.default_device(jax.devices("cpu")[0]):
+            key_pg_jax = jr.PRNGKey(42)
+
+    def sample_pg_wrapper(psi: np.ndarray) -> np.ndarray:
+        """Sample from Polya-Gamma distribution using either numpy or JAX backend."""
+        nonlocal key_pg_jax
+        if config.pg_jax:
+            # Use JAX-based sampler
+            key_pg_jax, subkey = jr.split(key_pg_jax)
+            psi_jax = jnp.asarray(psi)
+            samples = sample_pg_batch(subkey, psi_jax, h=1.0)
+            return np.asarray(samples)
+        else:
+            # Use original numpy-based sampler
+            return sample_polya_gamma(np.asarray(psi), rng_pg)
 
     # Print startup info
     print(f"[EM-init Trial inference] R={R} trials, S={S} units, J={J} bands, M={M} tapers")
@@ -233,7 +242,6 @@ def run_joint_inference_trials(
 
     # Design matrix (shared across trials)
     X = np.asarray(np.concatenate([np.ones((T0, 1)), lat_reim_np], axis=1), float)   # (T0, 1+2J)
-    X_jax = jnp.asarray(X)
 
     # ---------- 2) Initialise β, γ ----------
     if beta_init is None:
@@ -274,19 +282,9 @@ def run_joint_inference_trials(
         # sample ω_{s,r,t}
         omega_SRT = np.zeros((S, R, T0), float)
         for s in range(S):
-            beta_s = jnp.asarray(beta[s])
-            # psi_{r,t} = X @ β_s + H_{r} @ γ_{s,r}
-            psi_SR = []
             for r in range(R):
-                H_rt = jnp.asarray(H_SRTL[s, r])
-                g_sr = jnp.asarray(gamma[s, r])
-                psi_SR.append(X_jax @ beta_s + H_rt @ g_sr)
-            psi_SR = jnp.stack(psi_SR, axis=0)  # (R, T0)
-            k_s, key = jr.split(key)
-            omegas = jax.vmap(lambda psi_row, k:
-                              _sample_omega_pg_batch(k, psi_row, config.omega_floor))(
-                              psi_SR, jr.split(k_s, R))
-            omega_SRT[s] = np.asarray(omegas)
+                psi = X @ beta[s] + H_SRTL[s, r] @ gamma[s, r]
+                omega_SRT[s, r] = np.maximum(sample_pg_wrapper(psi), config.omega_floor)
 
         # β/γ update (shared β across trials) per unit
         for s in range(S):
@@ -355,18 +353,9 @@ def run_joint_inference_trials(
             # sample ω given γ_samp
             omega_SRT = np.zeros((S, R, T0), float)
             for s in range(S):
-                beta_s = jnp.asarray(beta[s])
-                psi_SR = []
                 for r in range(R):
-                    H_rt = jnp.asarray(H_SRTL[s, r])
-                    g_sr = jnp.asarray(gamma_samp[s, r])
-                    psi_SR.append(X_jax @ beta_s + H_rt @ g_sr)
-                psi_SR = jnp.stack(psi_SR, axis=0)
-                k_s, key = jr.split(key)
-                omegas = jax.vmap(lambda psi_row, k:
-                                  _sample_omega_pg_batch(k, psi_row, config.omega_floor))(
-                                  psi_SR, jr.split(k_s, R))
-                omega_SRT[s] = np.asarray(omegas)
+                    psi = X @ beta[s] + H_SRTL[s, r] @ gamma_samp[s, r]
+                    omega_SRT[s, r] = np.maximum(sample_pg_wrapper(psi), config.omega_floor)
 
             # β update with tight γ lock
             for s in range(S):
@@ -413,7 +402,6 @@ def run_joint_inference_trials(
         lat_reim_np = lat_reim_np[:T0]
         var_reim_np = var_reim_np[:T0]
         X = np.asarray(np.concatenate([np.ones((T0, 1)), lat_reim_np], axis=1), float)
-        X_jax = jnp.asarray(X)
 
         # trace bookkeeping
         trace.theta.append(theta)

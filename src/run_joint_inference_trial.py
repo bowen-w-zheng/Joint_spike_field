@@ -280,14 +280,33 @@ def run_joint_inference_trials(
 
         # β/γ update (shared β across trials) per unit
         for s in range(S):
+            if gamma_prior_Sigma is None:
+                Sigma_gamma_s = None
+            elif gamma_prior_Sigma.ndim == 2:
+                Sigma_gamma_s = gamma_prior_Sigma
+            elif gamma_prior_Sigma.ndim == 3:
+                Sigma_gamma_s = gamma_prior_Sigma[s]
+            else:
+                # allow (S,R,...) by taking trial-wise slice
+                Sigma_gamma_s = gamma_prior_Sigma[s]
+
+            if gamma_prior_mu is None:
+                mu_gamma_s = None
+            elif gamma_prior_mu.ndim == 1:
+                mu_gamma_s = gamma_prior_mu
+            elif gamma_prior_mu.ndim == 2:
+                mu_gamma_s = gamma_prior_mu[s]
+            else:
+                mu_gamma_s = gamma_prior_mu[s]
+
             _, beta_s, gamma_sr, _ = gibbs_update_beta_trials_shared(
                 key,
                 latent_reim=lat_reim_np[:T0],     # (T0, 2J)
                 spikes=spikes_SRT[s],             # (R, T0)
                 omega=omega_SRT[s],               # (R, T0)
                 H_hist=H_SRTL[s],                 # (R, T0, Rlags)
-                Sigma_gamma=(gamma_prior_Sigma[s] if (gamma_prior_Sigma is not None and gamma_prior_Sigma.ndim >= 2) else None),
-                mu_gamma=(gamma_prior_mu[s] if (gamma_prior_mu is not None and gamma_prior_mu.ndim >= 2) else None),
+                Sigma_gamma=Sigma_gamma_s,
+                mu_gamma=mu_gamma_s,
                 var_latent_reim=var_reim_np[:T0], # (T0, 2J)
                 tau2_lat=None,
                 config=tb_cfg,
@@ -380,10 +399,13 @@ def run_joint_inference_trials(
         beta_median = np.median(inner_beta_hist, axis=0)     # (S,P)
 
         # KF refresh on pooled trials
+        gamma_shared = np.asarray(gamma).mean(axis=1)
+
         mom = joint_kf_rts_moments_trials_fast(
             Y_cube=Y_trials, theta=theta,
             delta_spk=delta_spk, win_sec=window_sec, offset_sec=offset_sec,
-            beta=beta_median, gamma=gamma, spikes=spikes_SRT, omega=omega_SRT,
+            beta=beta_median, gamma_shared=gamma_shared,
+            spikes=spikes_SRT, omega=omega_SRT,
             coupled_bands_idx=np.arange(J, dtype=np.int64),
             freqs_for_phase=np.asarray(all_freqs, float),
             sidx=sidx, H_hist=H_SRTL,

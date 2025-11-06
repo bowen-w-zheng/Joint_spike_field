@@ -10,7 +10,7 @@ import jax
 import jax.numpy as jnp
 import jax.random as jr
 from jax import vmap
-from functools import partial
+import jax.scipy as jsp
 
 
 # ============================================================================
@@ -127,28 +127,25 @@ def _beta_gamma_shared_gamma_unit(
     # RHS:     b_b  = sum_r X^T κ_r
     #          b_g  = sum_r H_r^T κ_r + Prec_gamma @ mu_gamma
 
-    def accumulate_trial(r):
-        """Accumulate normal equations for trial r."""
-        omega_r = omega_rt[r]  # (T,)
-        kappa_r = kappa_rt[r]  # (T,)
-        H_r = H_rtl[r]         # (T, L)
-
-        # Weighted matrices
+    def accumulate_trial(omega_r, kappa_r, H_r, V_r):
+        """Accumulate normal equations for one trial."""
         omega_sqrt = jnp.sqrt(omega_r)[:, None]
         Xw = omega_sqrt * X       # (T, P)
         Hw = omega_sqrt * H_r     # (T, L)
 
-        # Normal equation blocks for this trial
         A_bb_r = Xw.T @ Xw        # (P, P)
         A_gg_r = Hw.T @ Hw        # (L, L)
         A_bg_r = Xw.T @ Hw        # (P, L)
         b_b_r = X.T @ kappa_r     # (P,)
         b_g_r = H_r.T @ kappa_r   # (L,)
+        diag_add_r = V_r.T @ omega_r  # (2B,)
 
-        return A_bb_r, A_gg_r, A_bg_r, b_b_r, b_g_r
+        return A_bb_r, A_gg_r, A_bg_r, b_b_r, b_g_r, diag_add_r
 
-    # Vectorize over trials
-    A_bb_trials, A_gg_trials, A_bg_trials, b_b_trials, b_g_trials = vmap(accumulate_trial)(jnp.arange(R))
+    # Vectorize over trials (R)
+    A_bb_trials, A_gg_trials, A_bg_trials, b_b_trials, b_g_trials, diag_add_trials = vmap(
+        accumulate_trial
+    )(omega_rt, kappa_rt, H_rtl, V_rtb)
 
     # Sum across trials
     A_bb = A_bb_trials.sum(axis=0)  # (P, P)
@@ -164,12 +161,7 @@ def _beta_gamma_shared_gamma_unit(
 
     # EIV correction for β latent features (sum over trials)
     # diag_add = sum_r V_r^T @ omega_r where V_r is (T, 2B)
-    def compute_eiv_correction(r):
-        V_r = V_rtb[r]        # (T, 2B)
-        omega_r = omega_rt[r]  # (T,)
-        return V_r.T @ omega_r  # (2B,)
-
-    diag_add = vmap(compute_eiv_correction)(jnp.arange(R)).sum(axis=0)  # (2B,)
+    diag_add = diag_add_trials.sum(axis=0)  # (2B,)
     A_bb = A_bb.at[1:, 1:].add(jnp.diag(diag_add))
 
     # Assemble full precision matrix: [β; γ]
@@ -188,12 +180,12 @@ def _beta_gamma_shared_gamma_unit(
 
     # Cholesky solve for mean
     L_chol = jnp.linalg.cholesky(Prec)
-    v = jax.scipy.linalg.solve_triangular(L_chol, h, lower=True)
-    mean = jax.scipy.linalg.solve_triangular(L_chol.T, v, lower=False)
+    v = jsp.linalg.solve_triangular(L_chol, h, lower=True)
+    mean = jsp.linalg.solve_triangular(L_chol.T, v, lower=False)
 
     # Sample from posterior
     eps = jr.normal(key1, shape=(dim,), dtype=X.dtype)
-    theta = mean + jax.scipy.linalg.solve_triangular(L_chol.T, eps, lower=False)
+    theta = mean + jsp.linalg.solve_triangular(L_chol.T, eps, lower=False)
 
     beta = theta[:P]
     gamma = theta[P:]
@@ -202,7 +194,8 @@ def _beta_gamma_shared_gamma_unit(
     beta_lat = beta[1:]  # (2B,)
     alpha_post = a0_ard + 0.5
     beta_post = b0_ard + 0.5 * (beta_lat ** 2)
-    tau2_lat_new = 1.0 / jr.gamma(key2, alpha_post, shape=(twoB,)) * beta_post
+    gamma_draw = jr.gamma(key2, alpha_post, shape=(twoB,), dtype=X.dtype)
+    tau2_lat_new = beta_post / jnp.maximum(gamma_draw, 1e-12)
 
     return beta, gamma, tau2_lat_new
 
@@ -218,7 +211,7 @@ _beta_gamma_shared_gamma_unit_jit = jax.jit(
 # Vectorized sampler across units
 # ============================================================================
 
-def gibbs_update_beta_trials_shared(
+def _gibbs_update_beta_trials_shared_vectorized(
     key: jr.KeyArray,
     X: jnp.ndarray,            # (T, P) shared design
     H_S_rtl: jnp.ndarray,      # (S, R, T, L) history per unit/trial
@@ -281,7 +274,7 @@ def gibbs_update_beta_trials_shared(
 
 
 # JIT-compile the vectorized function
-gibbs_update_beta_trials_shared_vectorized = jax.jit(gibbs_update_beta_trials_shared)
+gibbs_update_beta_trials_shared_vectorized = jax.jit(_gibbs_update_beta_trials_shared_vectorized)
 
 
 # ============================================================================

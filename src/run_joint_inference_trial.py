@@ -515,7 +515,7 @@ def run_joint_inference_trials(
         gamma_shared = np.asarray(gamma).mean(axis=1)
 
         mom = joint_kf_rts_moments_trials_fast(
-            Y_cube=Y_trials, theta=theta,
+            Y_trials=Y_trials, theta=theta,
             delta_spk=delta_spk, win_sec=window_sec, offset_sec=offset_sec,
             beta=beta_median, gamma_shared=gamma_shared,
             spikes=spikes_SRT, omega=np.asarray(omega_SRT),

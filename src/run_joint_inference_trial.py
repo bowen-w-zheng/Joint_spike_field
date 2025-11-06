@@ -363,8 +363,6 @@ def run_joint_inference_trials(
     X = np.asarray(np.concatenate([np.ones((T0, 1)), lat_reim_np], axis=1), float)   # (T0, 1+2J)
     X_jax = jnp.asarray(X)
 
-    print("[TRIAL-EM] Converted initial latents and design matrix")
-
     # Convert recurrent arrays to JAX once for the hot loops
     spikes_SRT_jax = jnp.asarray(spikes_SRT)
     H_SRTL_jax = jnp.asarray(H_SRTL)

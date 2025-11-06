@@ -20,7 +20,7 @@ from src.state_index import StateIndex
 # trial-aware core (pooling wrapper → calls your untouched core)
 from src.joint_inference_core_trial_fast import joint_kf_rts_moments_trials_fast
 # trial-aware beta sampler
-from src.beta_sampler_trials_jax import TrialBetaConfig, gibbs_update_beta_trials_shared
+from src.beta_sampler_trials_jax import TrialBetaConfig, gibbs_update_beta_single_unit
 # fast JAX PG sampler
 from src.polyagamma_jax import sample_pg_saddle_single
 
@@ -280,7 +280,7 @@ def run_joint_inference_trials(
 
         # β/γ update (shared β across trials) per unit
         for s in range(S):
-            _, beta_s, gamma_sr, _ = gibbs_update_beta_trials_shared(
+            _, beta_s, gamma_sr, _ = gibbs_update_beta_single_unit(
                 key,
                 latent_reim=lat_reim_np[:T0],     # (T0, 2J)
                 spikes=spikes_SRT[s],             # (R, T0)
@@ -356,7 +356,7 @@ def run_joint_inference_trials(
 
             # β update with tight γ lock
             for s in range(S):
-                _, beta_s, gamma_sr, _ = gibbs_update_beta_trials_shared(
+                _, beta_s, gamma_sr, _ = gibbs_update_beta_single_unit(
                     key,
                     latent_reim=lat_reim_np[:T0],
                     spikes=spikes_SRT[s],

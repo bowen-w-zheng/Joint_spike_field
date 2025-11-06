@@ -280,15 +280,15 @@ def gibbs_update_beta_trials_shared(
     return jr.fold_in(key, 1), beta_S, gamma_S, tau2_S
 
 
-# JIT-compile the vectorized function
-gibbs_update_beta_trials_shared_vectorized = jax.jit(gibbs_update_beta_trials_shared)
+# JIT-compile the main vectorized function
+gibbs_update_beta_trials_shared = jax.jit(gibbs_update_beta_trials_shared)
 
 
 # ============================================================================
-# Backward compatibility wrapper (single-unit API)
+# Single-unit wrapper for compatibility with per-unit loops
 # ============================================================================
 
-def gibbs_update_beta_trials_shared(
+def gibbs_update_beta_single_unit(
     key: jr.KeyArray,
     *,
     latent_reim: jnp.ndarray,      # (T, 2J) latent features (no intercept)
@@ -302,7 +302,10 @@ def gibbs_update_beta_trials_shared(
     config: Optional[TrialBetaConfig] = None,
 ) -> Tuple[jr.KeyArray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     """
-    Backward-compatible wrapper for single-unit API.
+    Single-unit wrapper for gibbs_update_beta_trials_shared.
+
+    Converts single-unit inputs to vectorized format, calls the main function,
+    and extracts results for one unit.
 
     Args:
         key: PRNG key
@@ -319,7 +322,7 @@ def gibbs_update_beta_trials_shared(
     Returns:
         key: updated PRNG key
         beta: (P,) β coefficients where P = 1 + 2J
-        gamma: (R, L) γ coefficients per trial
+        gamma: (R, L) γ coefficients (broadcasted from shared gamma)
         tau2_lat: (2J,) updated ARD variances
     """
     if config is None:
@@ -337,27 +340,22 @@ def gibbs_update_beta_trials_shared(
 
     # Build design matrix X = [1, latent_reim]
     X = build_design_jax(latent_reim)  # (T, P) where P = 1 + 2J
-    P = X.shape[1]
 
     # Prepare variances V_rtb: (R, T, 2J)
     if var_latent_reim is None:
         V_rtb = jnp.zeros((R, T, twoJ), dtype=latent_reim.dtype)
     else:
         var_latent_reim = jnp.asarray(var_latent_reim)
-        # Broadcast (T, 2J) -> (R, T, 2J)
         V_rtb = jnp.tile(var_latent_reim[None, ...], (R, 1, 1))
 
     # Prepare gamma precision Prec_gamma_ll
     if Sigma_gamma is None:
-        # Default: weak prior (large variance)
         Prec_gamma_ll = jnp.eye(L, dtype=latent_reim.dtype) * 1e-6
     else:
         Sigma_gamma = jnp.asarray(Sigma_gamma)
         if Sigma_gamma.ndim == 2:
-            # (L, L) -> invert
             Prec_gamma_ll = jnp.linalg.inv(Sigma_gamma + 1e-8 * jnp.eye(L))
         elif Sigma_gamma.ndim == 3:
-            # (R, L, L) -> average across trials then invert
             Sigma_avg = Sigma_gamma.mean(axis=0)
             Prec_gamma_ll = jnp.linalg.inv(Sigma_avg + 1e-8 * jnp.eye(L))
         else:
@@ -369,42 +367,39 @@ def gibbs_update_beta_trials_shared(
     else:
         mu_gamma = jnp.asarray(mu_gamma)
         if mu_gamma.ndim == 1:
-            # (L,)
             mu_gamma_l = mu_gamma
         elif mu_gamma.ndim == 2:
-            # (R, L) -> average across trials
             mu_gamma_l = mu_gamma.mean(axis=0)
         else:
             raise ValueError(f"mu_gamma has unexpected shape: {mu_gamma.shape}")
 
-    # Prepare ARD variances tau2_lat_b
+    # Prepare ARD variances
     if tau2_lat is None:
         tau2_lat_b = jnp.ones(twoJ, dtype=latent_reim.dtype)
     else:
         tau2_lat_b = jnp.asarray(tau2_lat)
 
-    # Reshape inputs to add unit dimension (S=1)
-    H_S_rtl = H_hist[None, ...]        # (1, R, T, L)
-    spikes_S_rt = spikes[None, ...]    # (1, R, T)
-    omega_S_rt = omega[None, ...]      # (1, R, T)
-    V_S_rtb = V_rtb[None, ...]         # (1, R, T, 2J)
-    Prec_gamma_S_ll = Prec_gamma_ll[None, ...]  # (1, L, L)
-    mu_gamma_S_l = mu_gamma_l[None, ...]        # (1, L)
-    tau2_lat_S_b = tau2_lat_b[None, ...]        # (1, 2J)
+    # Add unit dimension (S=1) for vectorized function
+    H_S_rtl = H_hist[None, ...]
+    spikes_S_rt = spikes[None, ...]
+    omega_S_rt = omega[None, ...]
+    V_S_rtb = V_rtb[None, ...]
+    Prec_gamma_S_ll = Prec_gamma_ll[None, ...]
+    mu_gamma_S_l = mu_gamma_l[None, ...]
+    tau2_lat_S_b = tau2_lat_b[None, ...]
 
     # Call vectorized function
-    key_out, beta_S, gamma_S, tau2_S = gibbs_update_beta_trials_shared_vectorized(
+    key_out, beta_S, gamma_S, tau2_S = gibbs_update_beta_trials_shared(
         key, X, H_S_rtl, spikes_S_rt, omega_S_rt, V_S_rtb,
         Prec_gamma_S_ll, mu_gamma_S_l, tau2_lat_S_b, config
     )
 
     # Extract single-unit results
-    beta = beta_S[0]           # (P,)
-    gamma = gamma_S[0]         # (L,) - shared across trials
-    tau2_lat_new = tau2_S[0]   # (2J,)
+    beta = beta_S[0]
+    gamma_shared = gamma_S[0]
+    tau2_lat_new = tau2_S[0]
 
-    # The new API has gamma shared across trials (L,), but the old API expects (R, L)
-    # Broadcast to match old API expectations
-    gamma_broadcast = jnp.tile(gamma[None, :], (R, 1))  # (R, L)
+    # Broadcast shared gamma to (R, L) for compatibility
+    gamma_broadcast = jnp.tile(gamma_shared[None, :], (R, 1))
 
     return key_out, beta, gamma_broadcast, tau2_lat_new

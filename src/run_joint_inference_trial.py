@@ -16,6 +16,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src.params import OUParams
 from src.utils_joint import Trace
 from src.state_index import StateIndex
+from tqdm.auto import tqdm
 
 # trial-aware core (pooling wrapper → calls your untouched core)
 from src.joint_inference_core_trial_fast import joint_kf_rts_moments_trials_fast
@@ -321,11 +322,15 @@ def run_joint_inference_trials(
         config = InferenceTrialsEMConfig()
     key = config.key_jax or jr.PRNGKey(0)
 
+    print("[TRIAL-EM] Starting trial-aware joint inference...")
+
     Rtr, J, M, K = Y_trials.shape
     S, R, T_f = spikes_SRT.shape
     assert Rtr == R, "Y_trials and spikes must have the same trial count"
     Rlags = H_SRTL.shape[-1]
     P = 1 + 2 * J
+
+    print(f"[TRIAL-EM] Data dimensions: R={R}, S={S}, J={J}, M={M}, T={T_f}, Rlags={Rlags}")
 
     # ---------- 0) EM on trials → θ and σ_ε per trial ----------
     from src.em_ct_hier_jax import em_ct_hier_jax
@@ -333,12 +338,15 @@ def run_joint_inference_trials(
     if config.em_kwargs:
         em_kwargs.update(config.em_kwargs)
 
+    print("[TRIAL-EM] Running EM warm start...")
     res = em_ct_hier_jax(Y_trials=Y_trials, db=window_sec, **em_kwargs)
 
     theta, sig_eps_trials = _theta_from_em(res, J=J, M=M, Rtr=Rtr)   # OUParams, (R,J,M)
+    print("[TRIAL-EM] EM warm start complete")
 
     # ---------- 1) Upsample EM latents to fine grid ----------
     from src.upsample_ct_hier_fine import upsample_ct_hier_fine
+    print("[TRIAL-EM] Upsampling EM latents to fine grid...")
     ups = upsample_ct_hier_fine(
         Y_trials=Y_trials, res=res,
         delta_spk=delta_spk, win_sec=window_sec, offset_sec=offset_sec, T_f=None,
@@ -409,7 +417,9 @@ def run_joint_inference_trials(
     beta_hist = []
     gamma_hist = []
 
-    for _ in range(config.fixed_iter):
+    print("[TRIAL-EM] Starting warmup loop...")
+    warmup_iter = tqdm(range(config.fixed_iter), desc="Warmup (trial PG-Gibbs)")
+    for _ in warmup_iter:
         psi_SRT = _compute_psi_all(X_jax, beta, gamma, H_SRTL_jax)
         key_pg, key = jr.split(key)
         omega_SRT = _sample_omega_pg_matrix(key_pg, psi_SRT, config.omega_floor)
@@ -434,6 +444,8 @@ def run_joint_inference_trials(
 
     beta_hist = np.stack(beta_hist, axis=0)      # (fixed_iter, S, P)
     gamma_hist = np.stack(gamma_hist, axis=0)    # (fixed_iter, S, R, Rlags)
+
+    print("[TRIAL-EM] Warmup complete")
 
     # Freeze β0 per unit
     w = min(config.beta0_window, config.fixed_iter)
@@ -461,11 +473,19 @@ def run_joint_inference_trials(
     # ---------- 5) Refresh passes ----------
     sidx = StateIndex(J, M)
 
+    print(f"[TRIAL-EM] Starting {config.n_refreshes} refresh passes...")
     for rr in range(config.n_refreshes):
+        print(f"[TRIAL-EM] Refresh {rr + 1}/{config.n_refreshes}: sampling β/γ trajectories")
         inner_beta_hist = []
         inner_gamma_hist = []
 
-        for _ in range(config.inner_steps_per_refresh):
+        inner_iter = tqdm(
+            range(config.inner_steps_per_refresh),
+            desc=f"Refresh {rr + 1} inner PG steps",
+            leave=False,
+        )
+
+        for _ in inner_iter:
             # sample γ from posterior
             gamma_samp = np.zeros((S, R, Rlags), float)
             for s in range(S):
@@ -514,6 +534,8 @@ def run_joint_inference_trials(
         # KF refresh on pooled trials
         gamma_shared = np.asarray(gamma).mean(axis=1)
 
+        print(f"[TRIAL-EM] Refresh {rr + 1}: running pooled KF refresh")
+
         mom = joint_kf_rts_moments_trials_fast(
             Y_trials=Y_trials, theta=theta,
             delta_spk=delta_spk, win_sec=window_sec, offset_sec=offset_sec,
@@ -548,4 +570,7 @@ def run_joint_inference_trials(
             trace.beta.append(inner_beta_hist[i])
             trace.gamma.append(inner_gamma_hist[i])
 
+        print(f"[TRIAL-EM] Refresh {rr + 1} complete")
+
+    print("[TRIAL-EM] Inference complete")
     return np.asarray(beta), np.asarray(gamma), theta, trace

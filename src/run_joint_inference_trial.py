@@ -8,15 +8,19 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 import jax.random as jr
+import sys
+import os
+# Add parent directory to sys.path if running as script
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.params import OUParams
 from src.utils_joint import Trace
 from src.state_index import StateIndex
 
 # trial-aware core (pooling wrapper → calls your untouched core)
-from src.joint_inference_core_trial import joint_kf_rts_moments_trials
+from src.joint_inference_core_trial_fast import joint_kf_rts_moments_trials_fast
 # trial-aware beta sampler
-from src.beta_sampler_trials import gibbs_update_beta_trials_shared, TrialBetaConfig
+from src.beta_sampler_trials_jax import TrialBetaConfig, gibbs_update_beta_trials_shared
 # fast JAX PG sampler
 from src.polyagamma_jax import sample_pg_saddle_single
 
@@ -378,7 +382,7 @@ def run_joint_inference_trials(
         beta_median = np.median(inner_beta_hist, axis=0)     # (S,P)
 
         # KF refresh on pooled trials
-        mom = joint_kf_rts_moments_trials(
+        mom = joint_kf_rts_moments_trials_fast(
             Y_cube=Y_trials, theta=theta,
             delta_spk=delta_spk, win_sec=window_sec, offset_sec=offset_sec,
             beta=beta_median, gamma=gamma, spikes=spikes_SRT, omega=omega_SRT,

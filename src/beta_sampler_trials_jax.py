@@ -18,7 +18,7 @@ from functools import partial
 # ============================================================================
 
 @dataclass
-class TrialBetaJAXConfig:
+class TrialBetaConfig:
     """Configuration for trial-aware β/γ sampler (JAX-compatible pytree)."""
     omega_floor: float = 1e-3
     tau2_intercept: float = 1e4
@@ -39,9 +39,9 @@ class TrialBetaJAXConfig:
 
 # Register as pytree
 jax.tree_util.register_pytree_node(
-    TrialBetaJAXConfig,
-    TrialBetaJAXConfig._tree_flatten,
-    TrialBetaJAXConfig._tree_unflatten
+    TrialBetaConfig,
+    TrialBetaConfig._tree_flatten,
+    TrialBetaConfig._tree_unflatten
 )
 
 
@@ -218,7 +218,7 @@ _beta_gamma_shared_gamma_unit_jit = jax.jit(
 # Vectorized sampler across units
 # ============================================================================
 
-def gibbs_update_beta_trials_shared_gamma_jax(
+def gibbs_update_beta_trials_shared(
     key: jr.KeyArray,
     X: jnp.ndarray,            # (T, P) shared design
     H_S_rtl: jnp.ndarray,      # (S, R, T, L) history per unit/trial
@@ -228,7 +228,7 @@ def gibbs_update_beta_trials_shared_gamma_jax(
     Prec_gamma_S_ll: jnp.ndarray,  # (S, L, L) gamma precision per unit
     mu_gamma_S_l: jnp.ndarray,     # (S, L) gamma prior mean per unit
     tau2_lat_S_b: jnp.ndarray,     # (S, 2B) ARD variances per unit
-    cfg: TrialBetaJAXConfig,
+    cfg: TrialBetaConfig,
 ) -> Tuple[jr.KeyArray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     """
     Vectorized Gibbs update across S units, each with β/γ shared across R trials.
@@ -281,130 +281,4 @@ def gibbs_update_beta_trials_shared_gamma_jax(
 
 
 # JIT-compile the main function
-gibbs_update_beta_trials_shared_gamma_jax = jax.jit(gibbs_update_beta_trials_shared_gamma_jax)
-
-
-# ============================================================================
-# Single-unit wrapper for backward compatibility
-# ============================================================================
-
-def gibbs_update_beta_trials_shared(
-    key: jr.KeyArray,
-    latent_reim: jnp.ndarray,      # (T,2B) shared across R trials for single unit
-    spikes: jnp.ndarray,           # (R, T) for single unit
-    omega: jnp.ndarray,            # (R, T)
-    *,
-    H_hist: Optional[jnp.ndarray] = None,          # (R, T, Rlags) or None
-    Sigma_gamma: Optional[jnp.ndarray] = None,     # (Rlags,Rlags) or (R,Rlags,Rlags)
-    mu_gamma: Optional[jnp.ndarray] = None,        # (Rlags,) or (R,Rlags)
-    var_latent_reim: Optional[jnp.ndarray] = None, # (T,2B)
-    tau2_lat: Optional[jnp.ndarray] = None,        # (2B,)
-    config: TrialBetaJAXConfig = TrialBetaJAXConfig(),
-) -> Tuple[jr.KeyArray, jnp.ndarray, Optional[jnp.ndarray], jnp.ndarray]:
-    """
-    Single-unit wrapper for backward compatibility with non-vectorized code.
-
-    This wraps the vectorized implementation to handle a single unit's data.
-
-    Args:
-        key: PRNG key
-        latent_reim: (T, 2B) latent variables (shared across R trials)
-        spikes: (R, T) spikes for this unit
-        omega: (R, T) PG weights
-        H_hist: (R, T, Rlags) history design or None
-        Sigma_gamma: (Rlags, Rlags) gamma prior covariance or None
-        mu_gamma: (Rlags,) gamma prior mean or None
-        var_latent_reim: (T, 2B) latent variances or None
-        tau2_lat: (2B,) ARD variances or None
-        config: TrialBetaJAXConfig
-
-    Returns:
-        key: updated PRNG key
-        beta: (P,) where P = 1 + 2B
-        gamma: (R, Rlags) if H_hist provided, else None
-        tau2_lat_new: (2B,)
-    """
-    # Convert inputs to JAX arrays
-    latent_reim = jnp.asarray(latent_reim)
-    spikes = jnp.asarray(spikes)
-    omega = jnp.asarray(omega)
-
-    R, T = spikes.shape
-    twoB = latent_reim.shape[1]
-
-    # Build design matrix
-    X = build_design_jax(latent_reim)  # (T, P)
-    P = X.shape[1]
-
-    # Initialize tau2_lat if not provided
-    if tau2_lat is None:
-        tau2_lat = jnp.ones((twoB,), dtype=jnp.float64)
-    else:
-        tau2_lat = jnp.asarray(tau2_lat)
-
-    # Handle variance
-    if var_latent_reim is None:
-        V_rtb = jnp.zeros((R, T, twoB), dtype=jnp.float64)
-    else:
-        var_latent_reim = jnp.asarray(var_latent_reim)
-        # Broadcast to (R, T, 2B)
-        V_rtb = jnp.tile(var_latent_reim[None, :, :], (R, 1, 1))
-
-    if H_hist is None:
-        # No history - simplified case (beta only)
-        # We'll handle this by passing dummy history with L=1
-        L = 1
-        H_rtl = jnp.zeros((R, T, L), dtype=jnp.float64)
-        Prec_gamma_ll = jnp.eye(L, dtype=jnp.float64) * 1e-6  # Very weak prior
-        mu_gamma_l = jnp.zeros((L,), dtype=jnp.float64)
-        has_history = False
-    else:
-        H_hist = jnp.asarray(H_hist)
-        L = H_hist.shape[2]
-        H_rtl = H_hist
-        has_history = True
-
-        # Handle gamma priors
-        if Sigma_gamma is None:
-            Prec_gamma_ll = jnp.eye(L, dtype=jnp.float64) * 1e-4
-        else:
-            Sigma_gamma = jnp.asarray(Sigma_gamma)
-            if Sigma_gamma.ndim == 2:
-                Prec_gamma_ll = jnp.linalg.pinv(Sigma_gamma)
-            else:
-                # If (R, L, L), take the first one (assuming they're similar)
-                Prec_gamma_ll = jnp.linalg.pinv(Sigma_gamma[0])
-
-        if mu_gamma is None:
-            mu_gamma_l = jnp.zeros((L,), dtype=jnp.float64)
-        else:
-            mu_gamma = jnp.asarray(mu_gamma)
-            if mu_gamma.ndim == 1:
-                mu_gamma_l = mu_gamma
-            else:
-                mu_gamma_l = mu_gamma[0]
-
-    # Call the single-unit sampler
-    beta, gamma, tau2_lat_new = _beta_gamma_shared_gamma_unit_jit(
-        key, X, H_rtl, spikes, omega, V_rtb,
-        Prec_gamma_ll, mu_gamma_l, tau2_lat,
-        config.omega_floor, config.tau2_intercept, config.a0_ard, config.b0_ard
-    )
-
-    # Return format matches old API
-    if not has_history:
-        gamma_out = None
-    else:
-        # Old API returns (R, Rlags) but we have single shared gamma (L,)
-        # Broadcast to (R, L) for compatibility
-        gamma_out = jnp.tile(gamma[None, :], (R, 1))
-
-    return jr.fold_in(key, 1), beta, gamma_out, tau2_lat_new
-
-
-# ============================================================================
-# Aliases for backward compatibility
-# ============================================================================
-
-# Alias for compatibility with other files
-TrialBetaConfig = TrialBetaJAXConfig
+gibbs_update_beta_trials_shared = jax.jit(gibbs_update_beta_trials_shared)

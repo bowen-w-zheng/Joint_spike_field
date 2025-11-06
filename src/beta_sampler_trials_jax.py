@@ -18,7 +18,7 @@ from functools import partial
 # ============================================================================
 
 @dataclass
-class TrialBetaJAXConfig:
+class TrialBetaConfig:
     """Configuration for trial-aware β/γ sampler (JAX-compatible pytree)."""
     omega_floor: float = 1e-3
     tau2_intercept: float = 1e4
@@ -39,9 +39,9 @@ class TrialBetaJAXConfig:
 
 # Register as pytree
 jax.tree_util.register_pytree_node(
-    TrialBetaJAXConfig,
-    TrialBetaJAXConfig._tree_flatten,
-    TrialBetaJAXConfig._tree_unflatten
+    TrialBetaConfig,
+    TrialBetaConfig._tree_flatten,
+    TrialBetaConfig._tree_unflatten
 )
 
 
@@ -218,7 +218,7 @@ _beta_gamma_shared_gamma_unit_jit = jax.jit(
 # Vectorized sampler across units
 # ============================================================================
 
-def gibbs_update_beta_trials_shared_gamma_jax(
+def gibbs_update_beta_trials_shared(
     key: jr.KeyArray,
     X: jnp.ndarray,            # (T, P) shared design
     H_S_rtl: jnp.ndarray,      # (S, R, T, L) history per unit/trial
@@ -228,7 +228,7 @@ def gibbs_update_beta_trials_shared_gamma_jax(
     Prec_gamma_S_ll: jnp.ndarray,  # (S, L, L) gamma precision per unit
     mu_gamma_S_l: jnp.ndarray,     # (S, L) gamma prior mean per unit
     tau2_lat_S_b: jnp.ndarray,     # (S, 2B) ARD variances per unit
-    cfg: TrialBetaJAXConfig,
+    cfg: TrialBetaConfig,
 ) -> Tuple[jr.KeyArray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     """
     Vectorized Gibbs update across S units, each with β/γ shared across R trials.
@@ -281,4 +281,4 @@ def gibbs_update_beta_trials_shared_gamma_jax(
 
 
 # JIT-compile the main function
-gibbs_update_beta_trials_shared_gamma_jax = jax.jit(gibbs_update_beta_trials_shared_gamma_jax)
+gibbs_update_beta_trials_shared = jax.jit(gibbs_update_beta_trials_shared)

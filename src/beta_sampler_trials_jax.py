@@ -200,11 +200,12 @@ def _beta_gamma_shared_gamma_unit(
     return beta, gamma, tau2_lat_new
 
 
-# JIT-compile the single-unit sampler with static config params
-_beta_gamma_shared_gamma_unit_jit = jax.jit(
-    _beta_gamma_shared_gamma_unit,
-    static_argnames=('omega_floor', 'tau2_intercept', 'a0_ard', 'b0_ard')
-)
+# JIT-compile the single-unit sampler. We avoid treating the scalar hyper-parameters
+# as static arguments so the function can be called from other JIT-compiled
+# contexts without requiring host-side Python floats. This prevents hashing
+# errors when the sampler is invoked with traced values (e.g. inside `vmap` or
+# higher-level JITs).
+_beta_gamma_shared_gamma_unit_jit = jax.jit(_beta_gamma_shared_gamma_unit)
 
 
 # ============================================================================

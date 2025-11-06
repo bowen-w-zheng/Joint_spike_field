@@ -40,6 +40,133 @@ def _build_design_jax(latent_reim: jnp.ndarray) -> jnp.ndarray:
     return jnp.concatenate([jnp.ones((T, 1)), latent_reim], axis=1)
 
 
+@jax.jit
+def _compute_psi_all(
+    X: jnp.ndarray,
+    beta_S: jnp.ndarray,
+    gamma_SRL: jnp.ndarray,
+    H_SRTL: jnp.ndarray,
+) -> jnp.ndarray:
+    """Compute ψ for all units/trials without Python loops."""
+
+    def _per_unit(beta_s, gamma_sr, H_sr):
+        base = X @ beta_s  # (T,)
+
+        def _per_trial(gamma_r, H_r):
+            return base + H_r @ gamma_r
+
+        return jax.vmap(_per_trial, in_axes=(0, 0))(gamma_sr, H_sr)
+
+    return jax.vmap(_per_unit, in_axes=(0, 0, 0))(beta_S, gamma_SRL, H_SRTL)
+
+
+@jax.jit
+def _sample_omega_pg_matrix(
+    key: "jr.KeyArray",
+    psi_SRT: jnp.ndarray,
+    omega_floor: float,
+) -> jnp.ndarray:
+    """Vectorized Polyagamma sampling across (S, R, T)."""
+
+    S, R, T = psi_SRT.shape
+    keys = jr.split(key, S * R)
+    omega_flat = jax.vmap(
+        lambda k, psi: _sample_omega_pg_batch(k, psi, omega_floor)
+    )(keys, psi_SRT.reshape(-1, T))
+    return omega_flat.reshape(S, R, T)
+
+
+def _broadcast_gamma_trials(gamma_S_l: jnp.ndarray, R: int) -> jnp.ndarray:
+    """Broadcast shared γ coefficients across trials."""
+
+    return jnp.broadcast_to(gamma_S_l[:, None, :], (gamma_S_l.shape[0], R, gamma_S_l.shape[1]))
+
+
+def _reduce_mu(mu_raw: Optional[np.ndarray], L: int) -> np.ndarray:
+    if mu_raw is None:
+        return np.zeros(L, dtype=float)
+    mu_arr = np.asarray(mu_raw, float)
+    if mu_arr.ndim == 1:
+        assert mu_arr.shape[0] == L, "mu prior length mismatch"
+        return mu_arr
+    if mu_arr.ndim == 2:
+        assert mu_arr.shape[1] == L, "mu prior shape mismatch"
+        return mu_arr.mean(axis=0)
+    raise ValueError(f"mu prior has unsupported shape: {mu_arr.shape}")
+
+
+def _prec_from_sigma(Sigma_raw: Optional[np.ndarray], L: int) -> np.ndarray:
+    if Sigma_raw is None:
+        return np.eye(L, dtype=float) * 1e-6
+    Sigma_arr = np.asarray(Sigma_raw, float)
+    if Sigma_arr.ndim == 2:
+        base = Sigma_arr
+    elif Sigma_arr.ndim == 3:
+        assert Sigma_arr.shape[1] == L and Sigma_arr.shape[2] == L, "Sigma prior shape mismatch"
+        base = Sigma_arr.mean(axis=0)
+    else:
+        raise ValueError(f"Sigma prior has unsupported shape: {Sigma_arr.shape}")
+    base = base + 1e-8 * np.eye(L, dtype=float)
+    return np.linalg.inv(base)
+
+
+def _slice_mu(mu_prior: Optional[np.ndarray], s: int, S: int, R: int) -> Optional[np.ndarray]:
+    if mu_prior is None:
+        return None
+    mu_arr = np.asarray(mu_prior, float)
+    if mu_arr.ndim == 1:
+        return mu_arr
+    if mu_arr.ndim == 2:
+        if mu_arr.shape[0] == S:
+            return mu_arr[s]
+        if mu_arr.shape[0] == R:
+            return mu_arr
+    if mu_arr.ndim == 3:
+        return mu_arr[s]
+    raise ValueError(f"mu prior has unsupported shape: {mu_arr.shape}")
+
+
+def _slice_sigma(Sigma_prior: Optional[np.ndarray], s: int, S: int, R: int) -> Optional[np.ndarray]:
+    if Sigma_prior is None:
+        return None
+    Sigma_arr = np.asarray(Sigma_prior, float)
+    if Sigma_arr.ndim == 2:
+        return Sigma_arr
+    if Sigma_arr.ndim == 3:
+        if Sigma_arr.shape[0] == S:
+            return Sigma_arr[s]
+        if Sigma_arr.shape[0] == R:
+            return Sigma_arr
+    if Sigma_arr.ndim == 4:
+        return Sigma_arr[s]
+    raise ValueError(f"Sigma prior has unsupported shape: {Sigma_arr.shape}")
+
+
+def _prepare_gamma_priors(
+    mu_prior: Optional[np.ndarray],
+    Sigma_prior: Optional[np.ndarray],
+    S: int,
+    R: int,
+    L: int,
+    dtype,
+) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    """Build (precision, mean) arrays for the vectorized β/γ sampler."""
+
+    mu_out = np.zeros((S, L), dtype=float)
+    prec_out = np.zeros((S, L, L), dtype=float)
+
+    for s in range(S):
+        mu_raw = _slice_mu(mu_prior, s, S, R)
+        Sigma_raw = _slice_sigma(Sigma_prior, s, S, R)
+        mu_out[s] = _reduce_mu(mu_raw, L)
+        prec_out[s] = _prec_from_sigma(Sigma_raw, L)
+
+    return (
+        jnp.asarray(prec_out, dtype=dtype),
+        jnp.asarray(mu_out, dtype=dtype),
+    )
+
+
 # ========================= Config =========================
 
 @dataclass
@@ -228,12 +355,20 @@ def run_joint_inference_trials(
     X = np.asarray(np.concatenate([np.ones((T0, 1)), lat_reim_np], axis=1), float)   # (T0, 1+2J)
     X_jax = jnp.asarray(X)
 
+    # Convert recurrent arrays to JAX once for the hot loops
+    spikes_SRT_jax = jnp.asarray(spikes_SRT)
+    H_SRTL_jax = jnp.asarray(H_SRTL)
+    var_reim_jax = jnp.asarray(var_reim_np)
+    V_SRTB = jnp.broadcast_to(var_reim_jax[None, None, :, :], (S, R, T0, 2 * J))
+
     # ---------- 2) Initialise β, γ ----------
     if beta_init is None:
         beta = np.zeros((S, P), float)
     else:
         beta = np.asarray(beta_init, float)
         assert beta.shape == (S, P)
+
+    beta = jnp.asarray(beta)
 
     if gamma_prior_mu is None:
         gamma = np.zeros((S, R, Rlags), float)
@@ -244,6 +379,19 @@ def run_joint_inference_trials(
             gamma = np.broadcast_to(gamma_prior_mu[:, None, :], (S, R, Rlags))
         else:
             gamma = np.asarray(gamma_prior_mu, float)
+
+    gamma = jnp.asarray(gamma)
+
+    tau2_lat = jnp.ones((S, 2 * J), dtype=X_jax.dtype)
+
+    Prec_gamma_init, mu_gamma_init = _prepare_gamma_priors(
+        gamma_prior_mu,
+        gamma_prior_Sigma,
+        S,
+        R,
+        Rlags,
+        X_jax.dtype,
+    )
 
     # ---------- 3) Trace ----------
     trace = Trace()
@@ -258,64 +406,31 @@ def run_joint_inference_trials(
         a0_ard=config.a0_ard,
         b0_ard=config.b0_ard,
     )
-    beta_hist = []; gamma_hist = []
+    beta_hist = []
+    gamma_hist = []
 
-    for it in range(config.fixed_iter):
-        # sample ω_{s,r,t}
-        omega_SRT = np.zeros((S, R, T0), float)
-        for s in range(S):
-            beta_s = jnp.asarray(beta[s])
-            # psi_{r,t} = X @ β_s + H_{r} @ γ_{s,r}
-            psi_SR = []
-            for r in range(R):
-                H_rt = jnp.asarray(H_SRTL[s, r])
-                g_sr = jnp.asarray(gamma[s, r])
-                psi_SR.append(X_jax @ beta_s + H_rt @ g_sr)
-            psi_SR = jnp.stack(psi_SR, axis=0)  # (R, T0)
-            k_s, key = jr.split(key)
-            omegas = jax.vmap(lambda psi_row, k:
-                              _sample_omega_pg_batch(k, psi_row, config.omega_floor))(
-                              psi_SR, jr.split(k_s, R))
-            omega_SRT[s] = np.asarray(omegas)
+    for _ in range(config.fixed_iter):
+        psi_SRT = _compute_psi_all(X_jax, beta, gamma, H_SRTL_jax)
+        key_pg, key = jr.split(key)
+        omega_SRT = _sample_omega_pg_matrix(key_pg, psi_SRT, config.omega_floor)
 
-        # β/γ update (shared β across trials) per unit
-        for s in range(S):
-            if gamma_prior_Sigma is None:
-                Sigma_gamma_s = None
-            elif gamma_prior_Sigma.ndim == 2:
-                Sigma_gamma_s = gamma_prior_Sigma
-            elif gamma_prior_Sigma.ndim == 3:
-                Sigma_gamma_s = gamma_prior_Sigma[s]
-            else:
-                # allow (S,R,...) by taking trial-wise slice
-                Sigma_gamma_s = gamma_prior_Sigma[s]
+        key, beta, gamma_shared, tau2_lat = gibbs_update_beta_trials_shared_vectorized(
+            key,
+            X_jax,
+            H_SRTL_jax,
+            spikes_SRT_jax,
+            omega_SRT,
+            V_SRTB,
+            Prec_gamma_init,
+            mu_gamma_init,
+            tau2_lat,
+            tb_cfg,
+        )
 
-            if gamma_prior_mu is None:
-                mu_gamma_s = None
-            elif gamma_prior_mu.ndim == 1:
-                mu_gamma_s = gamma_prior_mu
-            elif gamma_prior_mu.ndim == 2:
-                mu_gamma_s = gamma_prior_mu[s]
-            else:
-                mu_gamma_s = gamma_prior_mu[s]
+        gamma = _broadcast_gamma_trials(gamma_shared, R)
 
-            _, beta_s, gamma_sr, _ = gibbs_update_beta_trials_shared(
-                key,
-                latent_reim=lat_reim_np[:T0],     # (T0, 2J)
-                spikes=spikes_SRT[s],             # (R, T0)
-                omega=omega_SRT[s],               # (R, T0)
-                H_hist=H_SRTL[s],                 # (R, T0, Rlags)
-                Sigma_gamma=Sigma_gamma_s,
-                mu_gamma=mu_gamma_s,
-                var_latent_reim=var_reim_np[:T0], # (T0, 2J)
-                tau2_lat=None,
-                config=tb_cfg,
-            )
-            beta[s]  = np.asarray(beta_s)
-            gamma[s] = np.asarray(gamma_sr)
-
-        beta_hist.append(beta.copy())
-        gamma_hist.append(gamma.copy())
+        beta_hist.append(np.asarray(beta))
+        gamma_hist.append(np.asarray(gamma))
 
     beta_hist = np.stack(beta_hist, axis=0)      # (fixed_iter, S, P)
     gamma_hist = np.stack(gamma_hist, axis=0)    # (fixed_iter, S, R, Rlags)
@@ -323,7 +438,8 @@ def run_joint_inference_trials(
     # Freeze β0 per unit
     w = min(config.beta0_window, config.fixed_iter)
     beta0_fixed = np.median(beta_hist[-w:, :, 0], axis=0)    # (S,)
-    beta[:, 0] = beta0_fixed
+    beta0_fixed_jax = jnp.asarray(beta0_fixed, dtype=beta.dtype)
+    beta = beta.at[:, 0].set(beta0_fixed_jax)
 
     # γ posteriors per (s,r)
     mu_g_post = gamma_hist.mean(axis=0)                      # (S,R,Rlags)
@@ -349,50 +465,47 @@ def run_joint_inference_trials(
         inner_beta_hist = []
         inner_gamma_hist = []
 
-        for it in range(config.inner_steps_per_refresh):
+        for _ in range(config.inner_steps_per_refresh):
             # sample γ from posterior
-            gamma_samp = np.zeros_like(gamma)
+            gamma_samp = np.zeros((S, R, Rlags), float)
             for s in range(S):
                 for r in range(R):
                     L = np.linalg.cholesky(Sig_g_post[s, r])
                     gamma_samp[s, r] = mu_g_post[s, r] + L @ np.random.randn(Rlags)
 
             # sample ω given γ_samp
-            omega_SRT = np.zeros((S, R, T0), float)
-            for s in range(S):
-                beta_s = jnp.asarray(beta[s])
-                psi_SR = []
-                for r in range(R):
-                    H_rt = jnp.asarray(H_SRTL[s, r])
-                    g_sr = jnp.asarray(gamma_samp[s, r])
-                    psi_SR.append(X_jax @ beta_s + H_rt @ g_sr)
-                psi_SR = jnp.stack(psi_SR, axis=0)
-                k_s, key = jr.split(key)
-                omegas = jax.vmap(lambda psi_row, k:
-                                  _sample_omega_pg_batch(k, psi_row, config.omega_floor))(
-                                  psi_SR, jr.split(k_s, R))
-                omega_SRT[s] = np.asarray(omegas)
+            gamma_samp_jax = jnp.asarray(gamma_samp)
+            psi_SRT = _compute_psi_all(X_jax, beta, gamma_samp_jax, H_SRTL_jax)
+            key_pg, key = jr.split(key)
+            omega_SRT = _sample_omega_pg_matrix(key_pg, psi_SRT, config.omega_floor)
 
-            # β update with tight γ lock
-            for s in range(S):
-                _, beta_s, gamma_sr, _ = gibbs_update_beta_trials_shared(
-                    key,
-                    latent_reim=lat_reim_np[:T0],
-                    spikes=spikes_SRT[s],
-                    omega=omega_SRT[s],
-                    H_hist=H_SRTL[s],
-                    Sigma_gamma=Sig_g_lock[s],
-                    mu_gamma=gamma_samp[s],
-                    var_latent_reim=var_reim_np[:T0],
-                    tau2_lat=None,
-                    config=tb_cfg,
-                )
-                beta[s]  = np.asarray(beta_s)
-                gamma[s] = np.asarray(gamma_sr)
+            Prec_gamma_lock, mu_gamma_lock = _prepare_gamma_priors(
+                gamma_samp,
+                Sig_g_lock,
+                S,
+                R,
+                Rlags,
+                X_jax.dtype,
+            )
 
-            beta[:, 0] = beta0_fixed
-            inner_beta_hist.append(beta.copy())
-            inner_gamma_hist.append(gamma.copy())
+            key, beta, gamma_shared, tau2_lat = gibbs_update_beta_trials_shared_vectorized(
+                key,
+                X_jax,
+                H_SRTL_jax,
+                spikes_SRT_jax,
+                omega_SRT,
+                V_SRTB,
+                Prec_gamma_lock,
+                mu_gamma_lock,
+                tau2_lat,
+                tb_cfg,
+            )
+
+            gamma = _broadcast_gamma_trials(gamma_shared, R)
+            beta = beta.at[:, 0].set(beta0_fixed_jax)
+
+            inner_beta_hist.append(np.asarray(beta))
+            inner_gamma_hist.append(np.asarray(gamma))
 
         inner_beta_hist = np.stack(inner_beta_hist, axis=0)
         inner_gamma_hist = np.stack(inner_gamma_hist, axis=0)
@@ -402,10 +515,10 @@ def run_joint_inference_trials(
         gamma_shared = np.asarray(gamma).mean(axis=1)
 
         mom = joint_kf_rts_moments_trials_fast(
-            Y_cube=Y_trials, theta=theta,
+            Y_trials=Y_trials, theta=theta,
             delta_spk=delta_spk, win_sec=window_sec, offset_sec=offset_sec,
             beta=beta_median, gamma_shared=gamma_shared,
-            spikes=spikes_SRT, omega=omega_SRT,
+            spikes=spikes_SRT, omega=np.asarray(omega_SRT),
             coupled_bands_idx=np.arange(J, dtype=np.int64),
             freqs_for_phase=np.asarray(all_freqs, float),
             sidx=sidx, H_hist=H_SRTL,
@@ -422,6 +535,10 @@ def run_joint_inference_trials(
         var_reim_np = var_reim_np[:T0]
         X = np.asarray(np.concatenate([np.ones((T0, 1)), lat_reim_np], axis=1), float)
         X_jax = jnp.asarray(X)
+        var_reim_jax = jnp.asarray(var_reim_np)
+        V_SRTB = jnp.broadcast_to(var_reim_jax[None, None, :, :], (S, R, T0, 2 * J))
+        spikes_SRT_jax = jnp.asarray(spikes_SRT)
+        H_SRTL_jax = jnp.asarray(H_SRTL)
 
         # trace bookkeeping
         trace.theta.append(theta)
@@ -431,4 +548,4 @@ def run_joint_inference_trials(
             trace.beta.append(inner_beta_hist[i])
             trace.gamma.append(inner_gamma_hist[i])
 
-    return beta, gamma, theta, trace
+    return np.asarray(beta), np.asarray(gamma), theta, trace

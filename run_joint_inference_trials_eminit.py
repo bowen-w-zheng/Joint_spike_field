@@ -240,8 +240,15 @@ def run_joint_inference_trials(
     print(f"[EM-init Trial inference] Warm-up: {config.fixed_iter} iterations")
     print(f"[EM-init Trial inference] Refresh: {config.n_refreshes} passes × {config.inner_steps_per_refresh} steps")
 
-    # Design matrix (shared across trials)
-    X = np.asarray(np.concatenate([np.ones((T0, 1)), lat_reim_np], axis=1), float)   # (T0, 1+2J)
+    # Stable slices (for Gibbs cache hits - critical for JAX performance!)
+    lat_slice = jnp.asarray(lat_reim_np[:T0])                                       # (T0, 2J) JAX array
+    var_slice = np.ascontiguousarray(var_reim_np[:T0], dtype=np.float64)           # (T0, 2J)
+    X_slice = np.ascontiguousarray(
+        np.concatenate([np.ones((T0, 1)), np.asarray(lat_slice)], axis=1),
+        dtype=np.float64
+    )  # (T0, 1+2J)
+    spikes_slices = [jnp.asarray(spikes_SRT[s, :, :T0]) for s in range(S)]         # list of (R, T0)
+    H_slices = [np.asarray(H_SRTL[s, :, :T0, :]) for s in range(S)]                # list of (R, T0, Rlags)
 
     # ---------- 2) Initialise β, γ ----------
     if beta_init is None:
@@ -260,10 +267,10 @@ def run_joint_inference_trials(
         else:
             gamma = np.asarray(gamma_prior_mu, float)
 
-    # ---------- 3) Trace ----------
+    # ---------- 3) Trace (initialized after stable slices created) ----------
     trace = Trace()
     trace.theta.append(theta)
-    trace.latent.append(jnp.asarray(lat_reim_np))
+    trace.latent.append(lat_slice)      # Use stable JAX array
     trace.fine_latent.append(mu_fine0)  # store full (2JM) fine latent
 
     # ---------- 4) WARMUP: PG–Gibbs with shared β across trials ----------
@@ -279,24 +286,24 @@ def run_joint_inference_trials(
 
     pbar_warm = tqdm(range(config.fixed_iter), unit="it", desc="Warm-up (β/γ shared per unit)", mininterval=0.3)
     for it in pbar_warm:
-        # sample ω_{s,r,t}
+        # sample ω_{s,r,t} - use stable arrays for cache hits
         omega_SRT = np.zeros((S, R, T0), float)
         for s in range(S):
             for r in range(R):
-                psi = X @ beta[s] + H_SRTL[s, r] @ gamma[s, r]
+                psi = X_slice @ beta[s] + H_slices[s][r] @ gamma[s, r]
                 omega_SRT[s, r] = np.maximum(sample_pg_wrapper(psi), config.omega_floor)
 
-        # β/γ update (shared β across trials) per unit
+        # β/γ update (shared β across trials) per unit - use STABLE slices
         for s in range(S):
             _, beta_s, gamma_sr, _ = gibbs_update_beta_trials_shared(
                 key,
-                latent_reim=lat_reim_np[:T0],     # (T0, 2J)
-                spikes=spikes_SRT[s],             # (R, T0)
-                omega=omega_SRT[s],               # (R, T0)
-                H_hist=H_SRTL[s],                 # (R, T0, Rlags)
+                latent_reim=lat_slice,            # STABLE JAX array (T0, 2J)
+                spikes=spikes_slices[s],          # STABLE JAX array (R, T0)
+                omega=jnp.asarray(omega_SRT[s]),  # (R, T0)
+                H_hist=H_slices[s],               # STABLE array (R, T0, Rlags)
                 Sigma_gamma=(gamma_prior_Sigma[s] if (gamma_prior_Sigma is not None and gamma_prior_Sigma.ndim >= 2) else None),
                 mu_gamma=(gamma_prior_mu[s] if (gamma_prior_mu is not None and gamma_prior_mu.ndim >= 2) else None),
-                var_latent_reim=var_reim_np[:T0], # (T0, 2J)
+                var_latent_reim=var_slice,        # STABLE array (T0, 2J)
                 tau2_lat=None,
                 config=tb_cfg,
             )
@@ -350,24 +357,24 @@ def run_joint_inference_trials(
                     L = np.linalg.cholesky(Sig_g_post[s, r])
                     gamma_samp[s, r] = mu_g_post[s, r] + L @ np.random.randn(Rlags)
 
-            # sample ω given γ_samp
+            # sample ω given γ_samp - use stable arrays
             omega_SRT = np.zeros((S, R, T0), float)
             for s in range(S):
                 for r in range(R):
-                    psi = X @ beta[s] + H_SRTL[s, r] @ gamma_samp[s, r]
+                    psi = X_slice @ beta[s] + H_slices[s][r] @ gamma_samp[s, r]
                     omega_SRT[s, r] = np.maximum(sample_pg_wrapper(psi), config.omega_floor)
 
-            # β update with tight γ lock
+            # β update with tight γ lock - use STABLE slices
             for s in range(S):
                 _, beta_s, gamma_sr, _ = gibbs_update_beta_trials_shared(
                     key,
-                    latent_reim=lat_reim_np[:T0],
-                    spikes=spikes_SRT[s],
-                    omega=omega_SRT[s],
-                    H_hist=H_SRTL[s],
+                    latent_reim=lat_slice,            # STABLE JAX array
+                    spikes=spikes_slices[s],          # STABLE JAX array
+                    omega=jnp.asarray(omega_SRT[s]),  # (R, T0)
+                    H_hist=H_slices[s],               # STABLE array
                     Sigma_gamma=Sig_g_lock[s],
                     mu_gamma=gamma_samp[s],
-                    var_latent_reim=var_reim_np[:T0],
+                    var_latent_reim=var_slice,        # STABLE array
                     tau2_lat=None,
                     config=tb_cfg,
                 )
@@ -401,11 +408,19 @@ def run_joint_inference_trials(
         T0 = min(T0, lat_reim_np.shape[0])
         lat_reim_np = lat_reim_np[:T0]
         var_reim_np = var_reim_np[:T0]
-        X = np.asarray(np.concatenate([np.ones((T0, 1)), lat_reim_np], axis=1), float)
+
+        # Rebuild STABLE slices for next iteration (critical for JAX cache!)
+        lat_slice = jnp.asarray(lat_reim_np)                                        # (T0, 2J) JAX array
+        var_slice = np.ascontiguousarray(var_reim_np, dtype=np.float64)            # (T0, 2J)
+        X_slice = np.ascontiguousarray(
+            np.concatenate([np.ones((T0, 1)), np.asarray(lat_slice)], axis=1),
+            dtype=np.float64
+        )  # (T0, 1+2J)
+        # Note: spikes_slices and H_slices remain unchanged
 
         # trace bookkeeping
         trace.theta.append(theta)
-        trace.latent.append(jnp.asarray(lat_reim_np))
+        trace.latent.append(lat_slice)  # Use stable slice instead of creating new JAX array
         trace.fine_latent.append(mom.m_s)
         for i in range(config.inner_steps_per_refresh):
             trace.beta.append(inner_beta_hist[i])

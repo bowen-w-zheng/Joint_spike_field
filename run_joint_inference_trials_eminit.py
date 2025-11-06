@@ -152,15 +152,20 @@ def run_joint_inference_trials(
     key = config.key_jax or jr.PRNGKey(0)
 
     # Normalize spikes to (R, S, T_f)
+    # Detect format using Y_trials shape as ground truth
     spikes = np.asarray(spikes)
-    if spikes.shape[0] < spikes.shape[1]:
+    Rtr, J, M, K = Y_trials.shape
+
+    # Check if spikes is (R, S, T) or (S, R, T) by comparing with Y_trials
+    if spikes.shape[0] == Rtr:
+        # Already (R, S, T)
         R, S, T_total = spikes.shape
-    else:
+    elif spikes.shape[1] == Rtr:
+        # Must be (S, R, T) -> transpose
         spikes = np.transpose(spikes, (1, 0, 2))
         R, S, T_total = spikes.shape
-
-    Rtr, J, M, K = Y_trials.shape
-    assert Rtr == R
+    else:
+        raise ValueError(f"Cannot match spikes shape {spikes.shape} with Y_trials R={Rtr}")
     Rlags = H_hist.shape[-1]
 
     # Initialize PG sampler wrapper

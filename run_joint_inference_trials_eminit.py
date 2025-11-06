@@ -46,26 +46,6 @@ class InferenceTrialsEMConfig:
     store_inner_history: bool = False
 
 
-@jax.jit
-def sample_omega_all(rng: jr.KeyArray, psi_srt: jnp.ndarray, omega_floor: float) -> jnp.ndarray:
-    """
-    Draw PolyGamma(1, psi) for every (s,r,t) entry in psi_srt inside XLA.
-    psi_srt: (S, R, T) of log-odds; returns ω of same shape.
-    """
-    S, R, T = psi_srt.shape
-    # one (2,) key per (s,r,t) element
-    keys_srt = jr.split(rng, S * R * T).reshape((S, R, T, 2))
-
-    def sample_one(k2, z):
-        return jnp.maximum(sample_pg_saddle_single(k2, 1.0, z), omega_floor)
-
-    # vmap over r and t, fully on device
-    return jax.vmap(
-        lambda keys_rt, psi_rt: jax.vmap(lambda k_t, p_t: sample_one(k_t, p_t))(keys_rt, psi_rt),
-        in_axes=(0, 0),
-    )(keys_srt, psi_srt)  # -> (S, R, T)
-
-
 # ========================= EM → θ, latents adapters =========================
 
 def _theta_from_em(res, J: int, M: int, Rtr: int) -> Tuple[OUParams, np.ndarray]:
@@ -297,10 +277,9 @@ def run_joint_inference_trials(
         config.fixed_iter
     )
 
-    # Freeze β0
-    beta_hist_np = np.array(beta_hist)                         # (it,S,P)
+    # Freeze β0 (keep on device)
     w = min(config.beta0_window, config.fixed_iter)
-    beta0_fixed = jnp.asarray(np.median(beta_hist_np[-w:, :, 0], axis=0))
+    beta0_fixed = jnp.median(beta_hist[-w:, :, 0], axis=0)
     beta = beta.at[:, 0].set(beta0_fixed)
 
     # γ posterior from warmup history (host; off hot-path)
@@ -351,19 +330,14 @@ def run_joint_inference_trials(
             jnp.asarray(spikes_SRT), V_SRTB, Prec_g_lock, mu_g_post_j, Sig_g_post_j,
             config.inner_steps_per_refresh
         )
-        # robust β across inner
-        betaH_np = np.array(betaH)                                      # (inner,S,P)
-        beta_med = np.median(betaH_np, axis=0)                          # (S,P)
+        # robust β across inner (keep on device)
+        beta_med = jnp.median(betaH, axis=0)                            # (S,P)
 
         # Build ω for KF refresh using β_med and γ̂ = μ_g_post
-        psi_refresh = _psi_all(jnp.asarray(beta_med), mu_g_post_j, X, jnp.asarray(H_SRTL))  # (S,R,T0)
+        psi_refresh = _psi_all(beta_med, mu_g_post_j, X, jnp.asarray(H_SRTL))  # (S,R,T0)
         key, key_w = jr.split(key)
-        # vectorized PG on device
-        def pg_one(kk, pr_t):  # pr_t: (T0,)
-            keys_t = jr.split(kk, pr_t.shape[0])
-            return vmap(lambda k1, z1: jnp.maximum(sample_pg_saddle_single(k1, 1.0, z1), config.omega_floor))(keys_t, pr_t)
-        keys_sr = jr.split(key_w, S*R).reshape(S, R, 2)[:, :, 0]
-        omega_refresh = vmap(lambda ks, pr: pg_one(ks, pr))(keys_sr, psi_refresh)           # (S,R,T0)
+        # Vectorized PG sampling (reuse compiled function)
+        omega_refresh = sample_omega_all(key_w, psi_refresh, config.omega_floor)           # (S,R,T0)
 
         # Exact pooled-KF (κ′ trick; β shared per unit for exactness)
         mom = joint_kf_rts_moments_trials_fast(
@@ -391,9 +365,11 @@ def run_joint_inference_trials(
         trace.latent.append(jnp.asarray(lat_np))
         trace.fine_latent.append(mom.m_s)
         if config.store_inner_history:
+            betaH_np = np.array(betaH)  # Convert only if storing history
+            gammaH_np = np.array(gammaH)
             for i in range(config.inner_steps_per_refresh):
                 trace_beta_cache.append(betaH_np[i])    # (S,P)
-                trace_gamma_cache.append(np.array(gammaH[i]))  # (S,L)
+                trace_gamma_cache.append(gammaH_np[i])  # (S,L)
 
     # Final outputs (shared across trials per unit)
     beta_out  = np.array(beta)

@@ -73,7 +73,7 @@ def compute_trial_tfr_multitaper(
 
     # Global amplitude scale γ(T,NW;fs) that preserves correlation
     if apply_amplitude_scale:
-        kappa = _estimate_kappa(fs)                  # once per fs
+        kappa = _estimate_kappa(fs, window_ref=window_sec, NW_ref=NW, f_ref=30.0)                  # once per fs
         S_demod = S_demod * kappa
 
     # Reorder to (R, K, J, K_frames)

@@ -1,6 +1,7 @@
 from dataclasses import dataclass, field
 from typing import Callable, Optional, Sequence, Tuple, List
 import numpy as np
+import jax
 import jax.numpy as jnp
 import jax.random as jr
 from tqdm.auto import tqdm
@@ -8,9 +9,11 @@ from src.joint_inference_core import JointMoments
 from src.params import OUParams
 from src.priors import gamma_prior_simple
 from src.pg_utils import sample_polya_gamma
-from src.polyagamma_jax import sample_pg_batch  # JAX-based sampler
+from src.polyagamma_jax import sample_pg_saddle_single  # Direct JAX saddle point sampler
 from src.utils_joint import Trace
-
+print("jax version:", jax.__version__)
+# Enable 64-bit precision
+jax.config.update("jax_enable_x64", True)
 @dataclass
 class InferenceConfig:
     # NEW: do a warm-up before any latent refresh; freeze β0 after warm-up
@@ -73,7 +76,7 @@ def run_joint_inference(
     else:
         sigma_u = config.sigma_u
 
-    # Initialize a separate JAX key for PG sampling if using JAX sampler
+    # Initialize JAX RNG key if using JAX backend
     key_pg_jax = None
     if config.pg_jax:
         import jax
@@ -82,14 +85,19 @@ def run_joint_inference(
 
     # Wrapper function to switch between numpy and JAX Polyagamma samplers
     def sample_pg_wrapper(psi: np.ndarray) -> np.ndarray:
-        """Sample from Polya-Gamma distribution using either numpy or JAX backend."""
+        """
+        Sample from Polya-Gamma distribution using either numpy or JAX backend.
+
+        JAX version uses _sample_omega_pg_batch which is JIT-compiled at module level.
+        This matches the fast reference implementation pattern.
+        """
         nonlocal key_pg_jax
 
         if config.pg_jax:
-            # Use JAX-based sampler
+            # Use JAX sampler (direct vmap of saddle point method)
             key_pg_jax, subkey = jr.split(key_pg_jax)
-            psi_jax = jnp.asarray(psi)
-            samples = sample_pg_batch(subkey, psi_jax, h=1.0)
+            psi_jax = jnp.asarray(psi, dtype=jnp.float64)
+            samples = _sample_omega_pg_batch(subkey, psi_jax, config.omega_floor)
             return np.asarray(samples)
         else:
             # Use original numpy-based sampler

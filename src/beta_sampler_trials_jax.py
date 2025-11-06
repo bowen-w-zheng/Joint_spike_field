@@ -1,116 +1,284 @@
-# src/beta_sampler_trials_jax.py
+# beta_sampler_trials_jax.py
+# JAX-native β–γ PG–Gaussian sampler for trial-aware inference
+# β shared across trials, γ shared across trials per unit
+# Fully vectorized, JIT-compiled, device-resident
+
 from __future__ import annotations
 from dataclasses import dataclass
 from typing import Tuple
-import jax, jax.numpy as jnp, jax.random as jr
+import jax
+import jax.numpy as jnp
+import jax.random as jr
 from jax import vmap
+from functools import partial
+
+
+# ============================================================================
+# Config (registered as JAX pytree for passing through transformations)
+# ============================================================================
 
 @dataclass
 class TrialBetaJAXConfig:
-    omega_floor: float = 1e-6
-    tau2_intercept: float = 100.0**2
+    """Configuration for trial-aware β/γ sampler (JAX-compatible pytree)."""
+    omega_floor: float = 1e-3
+    tau2_intercept: float = 1e4
     a0_ard: float = 1e-2
     b0_ard: float = 1e-2
 
+    def _tree_flatten(self):
+        """Flatten config into (values, aux_data) for JAX pytree."""
+        children = (self.omega_floor, self.tau2_intercept, self.a0_ard, self.b0_ard)
+        aux_data = None
+        return children, aux_data
+
+    @classmethod
+    def _tree_unflatten(cls, aux_data, children):
+        """Reconstruct config from flattened representation."""
+        return cls(*children)
+
+
+# Register as pytree
+jax.tree_util.register_pytree_node(
+    TrialBetaJAXConfig,
+    TrialBetaJAXConfig._tree_flatten,
+    TrialBetaJAXConfig._tree_unflatten
+)
+
+
+# ============================================================================
+# JAX utility functions (all JIT-compiled)
+# ============================================================================
+
 @jax.jit
 def build_design_jax(latent_reim: jnp.ndarray) -> jnp.ndarray:
-    """latent_reim: (T,2B) → (T,1+2B) with leading intercept."""
+    """
+    Prepend intercept column - pure JAX.
+    latent_reim: (T, 2B)
+    returns:     (T, P) where P = 1 + 2B
+    """
     T = latent_reim.shape[0]
-    return jnp.concatenate([jnp.ones((T,1), latent_reim.dtype), latent_reim], axis=1)
+    return jnp.concatenate([jnp.ones((T, 1), dtype=latent_reim.dtype), latent_reim], axis=1)
 
-def _psd(A: jnp.ndarray, eps: float = 1e-8) -> jnp.ndarray:
-    return 0.5*(A+A.T) + eps*jnp.eye(A.shape[0], dtype=A.dtype)
+
+# ============================================================================
+# Single-unit β/γ sampler (shared across trials)
+# ============================================================================
 
 def _beta_gamma_shared_gamma_unit(
     key: jr.KeyArray,
-    X: jnp.ndarray,                 # (T,P), shared across trials
-    H_rtl: jnp.ndarray,             # (R,T,L)
-    spikes_rt: jnp.ndarray,         # (R,T) in {0,1}
-    omega_rt: jnp.ndarray,          # (R,T)
-    V_rtb: jnp.ndarray,             # (R,T,2B)  (tile shared V if needed)
-    Prec_gamma_ll: jnp.ndarray,     # (L,L)     (per-unit prior precision)
-    mu_gamma_l: jnp.ndarray,        # (L,)      (per-unit prior mean)
-    tau2_lat_b: jnp.ndarray,        # (2B,)
-    cfg: TrialBetaJAXConfig,
+    X: jnp.ndarray,           # (T, P) shared design across trials
+    H_rtl: jnp.ndarray,       # (R, T, L) history design per trial
+    spikes_rt: jnp.ndarray,   # (R, T) spikes
+    omega_rt: jnp.ndarray,    # (R, T) PG weights
+    V_rtb: jnp.ndarray,       # (R, T, 2B) latent variances per trial
+    Prec_gamma_ll: jnp.ndarray,  # (L, L) gamma precision
+    mu_gamma_l: jnp.ndarray,     # (L,) gamma prior mean
+    tau2_lat_b: jnp.ndarray,     # (2B,) ARD variances for latent features
+    omega_floor: float,
+    tau2_intercept: float,
+    a0_ard: float,
+    b0_ard: float,
 ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-    """Exact pooled info with shared β (P) and shared γ (L) across trials (per unit)."""
+    """
+    Gibbs update for single unit with β/γ shared across R trials.
+
+    Args:
+        key: PRNG key
+        X: (T, P) design matrix with intercept
+        H_rtl: (R, T, L) history design
+        spikes_rt: (R, T) spike counts
+        omega_rt: (R, T) PG auxiliary variables
+        V_rtb: (R, T, 2B) latent posterior variances
+        Prec_gamma_ll: (L, L) gamma prior precision
+        mu_gamma_l: (L,) gamma prior mean
+        tau2_lat_b: (2B,) current ARD variances
+        omega_floor: minimum omega value
+        tau2_intercept: intercept prior variance
+        a0_ard: ARD prior shape
+        b0_ard: ARD prior rate
+
+    Returns:
+        beta: (P,) shared β
+        gamma: (L,) shared γ
+        tau2_lat_new: (2B,) updated ARD variances
+    """
     key1, key2 = jr.split(key)
-    R, T = spikes_rt.shape
-    P    = X.shape[1]
+
+    R, T, L = H_rtl.shape
+    T_x, P = X.shape
+    assert T_x == T, "Design matrix and spikes time dimension mismatch"
     twoB = P - 1
-    L    = H_rtl.shape[2]
 
-    omega_rt = jnp.maximum(omega_rt, cfg.omega_floor)
-    kappa_rt = spikes_rt - 0.5
+    # Floor omega
+    omega_rt = jnp.maximum(omega_rt, omega_floor)
 
-    # Σ_r ω_r(t), Σ_r κ_r(t), Σ_r ω_r(t)H_r(t,:)
-    omega_sum_t  = omega_rt.sum(axis=0)                                # (T,)
-    kappa_sum_t  = kappa_rt.sum(axis=0)                                # (T,)
-    H_agg_tl     = jnp.einsum('rt,rtl->tl', omega_rt, H_rtl)          # (T,L)
+    # κ = spikes - 0.5
+    kappa_rt = spikes_rt - 0.5  # (R, T)
 
-    # Blocks
-    # A_bb = Xᵀ(ΣΩ)X + diag(tau^-2) + diag(Σ_r V_rᵀ ω_r)
-    Prec_beta_diag = jnp.concatenate([jnp.array([1.0/cfg.tau2_intercept], X.dtype),
-                                      1.0/jnp.maximum(tau2_lat_b,1e-12)])
-    A_bb = X.T @ (omega_sum_t[:,None]*X) + jnp.diag(Prec_beta_diag)
-    diag_add = jnp.einsum('rtb,rt->b', V_rtb, omega_rt)                # (2B,)
-    A_bb = A_bb.at[1:,1:].add(jnp.diag(diag_add))
+    # Build prior precision for β
+    Prec_beta_diag = jnp.zeros(P, dtype=X.dtype)
+    Prec_beta_diag = Prec_beta_diag.at[0].set(1.0 / tau2_intercept)
+    Prec_beta_diag = Prec_beta_diag.at[1:].set(1.0 / jnp.maximum(tau2_lat_b, 1e-12))
 
-    # A_bg = Xᵀ (ΣΩH),   A_gg = Σ(HᵀΩH) + Prec_γ
-    A_bg = X.T @ H_agg_tl                                             # (P,L)
-    A_gg = jnp.einsum('rtl,rt,rtm->lm', H_rtl, omega_rt, H_rtl) + Prec_gamma_ll  # (L,L)
+    # Accumulate normal equations across trials
+    # β block: A_bb = sum_r X^T Ω_r X
+    # γ block: A_gg = sum_r H_r^T Ω_r H_r + Prec_gamma
+    # cross:   A_bg = sum_r X^T Ω_r H_r
+    # RHS:     b_b  = sum_r X^T κ_r
+    #          b_g  = sum_r H_r^T κ_r + Prec_gamma @ mu_gamma
 
-    # b_b = Xᵀ(Σκ),   b_g = Σ(Hᵀ κ) + Prec_γ μ_γ
-    b_b = X.T @ kappa_sum_t                                           # (P,)
-    b_g = jnp.einsum('rtl,rt->l', H_rtl, kappa_rt) + Prec_gamma_ll @ mu_gamma_l  # (L,)
+    def accumulate_trial(r):
+        """Accumulate normal equations for trial r."""
+        omega_r = omega_rt[r]  # (T,)
+        kappa_r = kappa_rt[r]  # (T,)
+        H_r = H_rtl[r]         # (T, L)
 
-    # Solve θ = [β; γ]
-    Prec = jnp.block([[A_bb, A_bg],[A_bg.T, A_gg]])
-    rhs  = jnp.concatenate([b_b, b_g])
-    Prec = _psd(Prec, 1e-8)
-    Lc   = jnp.linalg.cholesky(Prec)
-    v    = jax.scipy.linalg.solve_triangular(Lc, rhs, lower=True)
-    mean = jax.scipy.linalg.solve_triangular(Lc.T, v, lower=False)
-    eps  = jr.normal(key1, (P+L,), dtype=X.dtype)
-    theta= mean + jax.scipy.linalg.solve_triangular(Lc.T, eps, lower=False)
+        # Weighted matrices
+        omega_sqrt = jnp.sqrt(omega_r)[:, None]
+        Xw = omega_sqrt * X       # (T, P)
+        Hw = omega_sqrt * H_r     # (T, L)
 
-    beta  = theta[:P]
-    gamma = theta[P:]                                                 # (L,)
+        # Normal equation blocks for this trial
+        A_bb_r = Xw.T @ Xw        # (P, P)
+        A_gg_r = Hw.T @ Hw        # (L, L)
+        A_bg_r = Xw.T @ Hw        # (P, L)
+        b_b_r = X.T @ kappa_r     # (P,)
+        b_g_r = H_r.T @ kappa_r   # (L,)
 
-    # ARD on β_lat
-    beta_lat = beta[1:]
-    alpha = cfg.a0_ard + 0.5
-    scale = 1.0/(cfg.b0_ard + 0.5*(beta_lat**2))
-    tau2_new = 1.0 / jr.gamma(key2, alpha, shape=(twoB,)) * (1.0/scale)
-    return beta, gamma, tau2_new
+        return A_bb_r, A_gg_r, A_bg_r, b_b_r, b_g_r
+
+    # Vectorize over trials
+    A_bb_trials, A_gg_trials, A_bg_trials, b_b_trials, b_g_trials = vmap(accumulate_trial)(jnp.arange(R))
+
+    # Sum across trials
+    A_bb = A_bb_trials.sum(axis=0)  # (P, P)
+    A_gg = A_gg_trials.sum(axis=0)  # (L, L)
+    A_bg = A_bg_trials.sum(axis=0)  # (P, L)
+    b_b = b_b_trials.sum(axis=0)    # (P,)
+    b_g = b_g_trials.sum(axis=0)    # (L,)
+
+    # Add priors
+    A_bb = A_bb + jnp.diag(Prec_beta_diag)
+    A_gg = A_gg + Prec_gamma_ll
+    b_g = b_g + Prec_gamma_ll @ mu_gamma_l
+
+    # EIV correction for β latent features (sum over trials)
+    # diag_add = sum_r V_r^T @ omega_r where V_r is (T, 2B)
+    def compute_eiv_correction(r):
+        V_r = V_rtb[r]        # (T, 2B)
+        omega_r = omega_rt[r]  # (T,)
+        return V_r.T @ omega_r  # (2B,)
+
+    diag_add = vmap(compute_eiv_correction)(jnp.arange(R)).sum(axis=0)  # (2B,)
+    A_bb = A_bb.at[1:, 1:].add(jnp.diag(diag_add))
+
+    # Assemble full precision matrix: [β; γ]
+    dim = P + L
+    Prec = jnp.zeros((dim, dim), dtype=X.dtype)
+    Prec = Prec.at[:P, :P].set(A_bb)
+    Prec = Prec.at[:P, P:].set(A_bg)
+    Prec = Prec.at[P:, :P].set(A_bg.T)
+    Prec = Prec.at[P:, P:].set(A_gg)
+
+    # RHS
+    h = jnp.concatenate([b_b, b_g])
+
+    # Symmetrize and regularize
+    Prec = 0.5 * (Prec + Prec.T) + 1e-8 * jnp.eye(dim, dtype=Prec.dtype)
+
+    # Cholesky solve for mean
+    L_chol = jnp.linalg.cholesky(Prec)
+    v = jax.scipy.linalg.solve_triangular(L_chol, h, lower=True)
+    mean = jax.scipy.linalg.solve_triangular(L_chol.T, v, lower=False)
+
+    # Sample from posterior
+    eps = jr.normal(key1, shape=(dim,), dtype=X.dtype)
+    theta = mean + jax.scipy.linalg.solve_triangular(L_chol.T, eps, lower=False)
+
+    beta = theta[:P]
+    gamma = theta[P:]
+
+    # ARD update for latent features
+    beta_lat = beta[1:]  # (2B,)
+    alpha_post = a0_ard + 0.5
+    beta_post = b0_ard + 0.5 * (beta_lat ** 2)
+    tau2_lat_new = 1.0 / jr.gamma(key2, alpha_post, shape=(twoB,)) * beta_post
+
+    return beta, gamma, tau2_lat_new
+
+
+# JIT-compile the single-unit sampler with static config params
+_beta_gamma_shared_gamma_unit_jit = jax.jit(
+    _beta_gamma_shared_gamma_unit,
+    static_argnames=('omega_floor', 'tau2_intercept', 'a0_ard', 'b0_ard')
+)
+
+
+# ============================================================================
+# Vectorized sampler across units
+# ============================================================================
 
 def gibbs_update_beta_trials_shared_gamma_jax(
     key: jr.KeyArray,
-    X: jnp.ndarray,                     # (T,P), shared across trials
-    H_S_rtl: jnp.ndarray,               # (S,R,T,L)
-    spikes_S_rt: jnp.ndarray,           # (S,R,T)
-    omega_S_rt: jnp.ndarray,            # (S,R,T)
-    V_S_rtb: jnp.ndarray,               # (S,R,T,2B)  (tile shared V to this shape upstream)
-    Prec_gamma_S_ll: jnp.ndarray,       # (S,L,L) or (L,L)
-    mu_gamma_S_l: jnp.ndarray,          # (S,L)   or (L,)
-    tau2_lat_S_b: jnp.ndarray,          # (S,2B)
-    cfg: TrialBetaJAXConfig = TrialBetaJAXConfig(),
+    X: jnp.ndarray,            # (T, P) shared design
+    H_S_rtl: jnp.ndarray,      # (S, R, T, L) history per unit/trial
+    spikes_S_rt: jnp.ndarray,  # (S, R, T) spikes per unit/trial
+    omega_S_rt: jnp.ndarray,   # (S, R, T) PG weights
+    V_S_rtb: jnp.ndarray,      # (S, R, T, 2B) latent variances
+    Prec_gamma_S_ll: jnp.ndarray,  # (S, L, L) gamma precision per unit
+    mu_gamma_S_l: jnp.ndarray,     # (S, L) gamma prior mean per unit
+    tau2_lat_S_b: jnp.ndarray,     # (S, 2B) ARD variances per unit
+    cfg: TrialBetaJAXConfig,
 ) -> Tuple[jr.KeyArray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     """
-    Vectorized over units (S). Returns:
-      key_next, beta_SP (S,P), gamma_SL (S,L), tau2_S2B (S,2B)
+    Vectorized Gibbs update across S units, each with β/γ shared across R trials.
+
+    Args:
+        key: PRNG key
+        X: (T, P) shared design matrix (with intercept)
+        H_S_rtl: (S, R, T, L) history design per unit
+        spikes_S_rt: (S, R, T) spike data
+        omega_S_rt: (S, R, T) PG auxiliary variables
+        V_S_rtb: (S, R, T, 2B) latent variances
+        Prec_gamma_S_ll: (S, L, L) gamma priors
+        mu_gamma_S_l: (S, L) gamma prior means
+        tau2_lat_S_b: (S, 2B) ARD variances
+        cfg: TrialBetaJAXConfig
+
+    Returns:
+        key: updated PRNG key
+        beta_S: (S, P) β coefficients
+        gamma_S: (S, L) γ coefficients
+        tau2_S: (S, 2B) updated ARD variances
     """
-    S = spikes_S_rt.shape[0]
+    S = H_S_rtl.shape[0]
 
-    # broadcast γ priors if shared
+    # Handle broadcasting for priors if needed
     if Prec_gamma_S_ll.ndim == 2:
-        Prec_gamma_S_ll = jnp.tile(Prec_gamma_S_ll[None, ...], (S,1,1))
-    if mu_gamma_S_l.ndim == 1:
-        mu_gamma_S_l = jnp.tile(mu_gamma_S_l[None, ...], (S,1))
+        # (L, L) -> broadcast to (S, L, L)
+        L = Prec_gamma_S_ll.shape[0]
+        Prec_gamma_S_ll = jnp.tile(Prec_gamma_S_ll[None, ...], (S, 1, 1))
 
+    if mu_gamma_S_l.ndim == 1:
+        # (L,) -> broadcast to (S, L)
+        L = mu_gamma_S_l.shape[0]
+        mu_gamma_S_l = jnp.tile(mu_gamma_S_l[None, ...], (S, 1))
+
+    # Split keys for each unit
     keys = jr.split(key, S)
-    beta_S, gamma_S, tau2_S = vmap(_beta_gamma_shared_gamma_unit)(
-        keys, X, H_S_rtl, spikes_S_rt, omega_S_rt, V_S_rtb,
-        Prec_gamma_S_ll, mu_gamma_S_l, tau2_lat_S_b, cfg
-    )
+
+    # Vectorize over units - extract config values as static args
+    beta_S, gamma_S, tau2_S = vmap(
+        lambda k, H_rtl, spk_rt, om_rt, V_rtb, Prec_g, mu_g, tau2_b:
+            _beta_gamma_shared_gamma_unit_jit(
+                k, X, H_rtl, spk_rt, om_rt, V_rtb, Prec_g, mu_g, tau2_b,
+                cfg.omega_floor, cfg.tau2_intercept, cfg.a0_ard, cfg.b0_ard
+            )
+    )(keys, H_S_rtl, spikes_S_rt, omega_S_rt, V_S_rtb,
+      Prec_gamma_S_ll, mu_gamma_S_l, tau2_lat_S_b)
+
     return jr.fold_in(key, 1), beta_S, gamma_S, tau2_S
+
+
+# JIT-compile the main function
+gibbs_update_beta_trials_shared_gamma_jax = jax.jit(gibbs_update_beta_trials_shared_gamma_jax)

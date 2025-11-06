@@ -255,10 +255,8 @@ def run_joint_inference_trials(
     tb_cfg = TrialBetaConfig(
         omega_floor=config.omega_floor,
         tau2_intercept=config.tau2_intercept,
-        tau2_gamma=config.tau2_gamma,
         a0_ard=config.a0_ard,
         b0_ard=config.b0_ard,
-        use_exact_cov=config.use_exact_cov,
     )
     beta_hist = []; gamma_hist = []
 

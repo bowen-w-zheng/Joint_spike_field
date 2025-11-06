@@ -280,5 +280,131 @@ def gibbs_update_beta_trials_shared(
     return jr.fold_in(key, 1), beta_S, gamma_S, tau2_S
 
 
-# JIT-compile the main function
-gibbs_update_beta_trials_shared = jax.jit(gibbs_update_beta_trials_shared)
+# JIT-compile the vectorized function
+gibbs_update_beta_trials_shared_vectorized = jax.jit(gibbs_update_beta_trials_shared)
+
+
+# ============================================================================
+# Backward compatibility wrapper (single-unit API)
+# ============================================================================
+
+def gibbs_update_beta_trials_shared(
+    key: jr.KeyArray,
+    *,
+    latent_reim: jnp.ndarray,      # (T, 2J) latent features (no intercept)
+    spikes: jnp.ndarray,           # (R, T) spikes for ONE unit
+    omega: jnp.ndarray,            # (R, T) PG weights for ONE unit
+    H_hist: jnp.ndarray,           # (R, T, L) history for ONE unit
+    Sigma_gamma: Optional[jnp.ndarray] = None,  # (R, L, L) or (L, L) or None
+    mu_gamma: Optional[jnp.ndarray] = None,     # (R, L) or (L,) or None
+    var_latent_reim: Optional[jnp.ndarray] = None,  # (T, 2J) or None
+    tau2_lat: Optional[jnp.ndarray] = None,     # (2J,) or None
+    config: Optional[TrialBetaConfig] = None,
+) -> Tuple[jr.KeyArray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """
+    Backward-compatible wrapper for single-unit API.
+
+    Args:
+        key: PRNG key
+        latent_reim: (T, 2J) latent features (without intercept)
+        spikes: (R, T) spike counts for one unit
+        omega: (R, T) PG auxiliary variables for one unit
+        H_hist: (R, T, L) history design for one unit
+        Sigma_gamma: (R, L, L) or (L, L) gamma prior covariance (or None)
+        mu_gamma: (R, L) or (L,) gamma prior mean (or None)
+        var_latent_reim: (T, 2J) latent variances (or None)
+        tau2_lat: (2J,) ARD variances (or None)
+        config: TrialBetaConfig instance
+
+    Returns:
+        key: updated PRNG key
+        beta: (P,) β coefficients where P = 1 + 2J
+        gamma: (R, L) γ coefficients per trial
+        tau2_lat: (2J,) updated ARD variances
+    """
+    if config is None:
+        config = TrialBetaConfig()
+
+    # Convert to JAX arrays
+    latent_reim = jnp.asarray(latent_reim)
+    spikes = jnp.asarray(spikes)
+    omega = jnp.asarray(omega)
+    H_hist = jnp.asarray(H_hist)
+
+    T, twoJ = latent_reim.shape
+    R, T_check, L = H_hist.shape
+    assert T == T_check, "Time dimension mismatch"
+
+    # Build design matrix X = [1, latent_reim]
+    X = build_design_jax(latent_reim)  # (T, P) where P = 1 + 2J
+    P = X.shape[1]
+
+    # Prepare variances V_rtb: (R, T, 2J)
+    if var_latent_reim is None:
+        V_rtb = jnp.zeros((R, T, twoJ), dtype=latent_reim.dtype)
+    else:
+        var_latent_reim = jnp.asarray(var_latent_reim)
+        # Broadcast (T, 2J) -> (R, T, 2J)
+        V_rtb = jnp.tile(var_latent_reim[None, ...], (R, 1, 1))
+
+    # Prepare gamma precision Prec_gamma_ll
+    if Sigma_gamma is None:
+        # Default: weak prior (large variance)
+        Prec_gamma_ll = jnp.eye(L, dtype=latent_reim.dtype) * 1e-6
+    else:
+        Sigma_gamma = jnp.asarray(Sigma_gamma)
+        if Sigma_gamma.ndim == 2:
+            # (L, L) -> invert
+            Prec_gamma_ll = jnp.linalg.inv(Sigma_gamma + 1e-8 * jnp.eye(L))
+        elif Sigma_gamma.ndim == 3:
+            # (R, L, L) -> average across trials then invert
+            Sigma_avg = Sigma_gamma.mean(axis=0)
+            Prec_gamma_ll = jnp.linalg.inv(Sigma_avg + 1e-8 * jnp.eye(L))
+        else:
+            raise ValueError(f"Sigma_gamma has unexpected shape: {Sigma_gamma.shape}")
+
+    # Prepare gamma prior mean mu_gamma_l
+    if mu_gamma is None:
+        mu_gamma_l = jnp.zeros(L, dtype=latent_reim.dtype)
+    else:
+        mu_gamma = jnp.asarray(mu_gamma)
+        if mu_gamma.ndim == 1:
+            # (L,)
+            mu_gamma_l = mu_gamma
+        elif mu_gamma.ndim == 2:
+            # (R, L) -> average across trials
+            mu_gamma_l = mu_gamma.mean(axis=0)
+        else:
+            raise ValueError(f"mu_gamma has unexpected shape: {mu_gamma.shape}")
+
+    # Prepare ARD variances tau2_lat_b
+    if tau2_lat is None:
+        tau2_lat_b = jnp.ones(twoJ, dtype=latent_reim.dtype)
+    else:
+        tau2_lat_b = jnp.asarray(tau2_lat)
+
+    # Reshape inputs to add unit dimension (S=1)
+    H_S_rtl = H_hist[None, ...]        # (1, R, T, L)
+    spikes_S_rt = spikes[None, ...]    # (1, R, T)
+    omega_S_rt = omega[None, ...]      # (1, R, T)
+    V_S_rtb = V_rtb[None, ...]         # (1, R, T, 2J)
+    Prec_gamma_S_ll = Prec_gamma_ll[None, ...]  # (1, L, L)
+    mu_gamma_S_l = mu_gamma_l[None, ...]        # (1, L)
+    tau2_lat_S_b = tau2_lat_b[None, ...]        # (1, 2J)
+
+    # Call vectorized function
+    key_out, beta_S, gamma_S, tau2_S = gibbs_update_beta_trials_shared_vectorized(
+        key, X, H_S_rtl, spikes_S_rt, omega_S_rt, V_S_rtb,
+        Prec_gamma_S_ll, mu_gamma_S_l, tau2_lat_S_b, config
+    )
+
+    # Extract single-unit results
+    beta = beta_S[0]           # (P,)
+    gamma = gamma_S[0]         # (L,) - shared across trials
+    tau2_lat_new = tau2_S[0]   # (2J,)
+
+    # The new API has gamma shared across trials (L,), but the old API expects (R, L)
+    # Broadcast to match old API expectations
+    gamma_broadcast = jnp.tile(gamma[None, :], (R, 1))  # (R, L)
+
+    return key_out, beta, gamma_broadcast, tau2_lat_new
